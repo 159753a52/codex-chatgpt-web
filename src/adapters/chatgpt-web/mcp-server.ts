@@ -1,4 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
+import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
@@ -25,6 +27,7 @@ const BRIDGE_TOOL_NAMES = new Set([
   "codex_view_image",
   "codex_tool_inventory",
   "codex_tool_call",
+  "codex_fetch_next_task",
   "codex_turn_complete",
 ]);
 
@@ -47,7 +50,8 @@ export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 90_000;
 const ZERO_RISK_MCP_INSTRUCTIONS = [
   "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id in its request block.",
   "Use that request_id with the Codex tools needed for the task.",
-  "When the task is finished, send the complete answer with codex_turn_complete.",
+  "After completing any work or answering any question, you MUST put your complete answer into step_summary and call codex_fetch_next_task to report it to the user. If next_task is '__POLL__', immediately call codex_fetch_next_task again with step_summary='__POLL__' to stay waiting. You MUST NEVER end this turn or conclude your response until codex_fetch_next_task returns has_next=false (which only happens on user /exit).",
+  "When the user signals /exit (has_next=false), send the complete answer with codex_turn_complete.",
   "If a tool returns an error, report that error instead of changing the request_id.",
 ].join(" ");
 
@@ -923,6 +927,103 @@ export async function runChatGptMcpServer(options: {
         return invoke(claimed.bindingId, bound, tool, { arguments: invocationArguments }, extra.signal);
       });
     },
+  );
+
+  server.registerTool(
+    "codex_fetch_next_task",
+    {
+      title: "Wait for user instruction and report progress",
+      description: afterSafeStart(contract, "Report current subtask progress/response and wait for user instructions without ending this turn. IMPORTANT: Put your full and complete answer for the user directly into step_summary so it is recorded in the local workspace. If has_next is true and next_task is '__POLL__', immediately call this tool again with step_summary='__POLL__' to continue waiting silently. If next_task is a real task, execute it. You MUST NOT end this turn until has_next is false (when user signals /exit)."),
+      inputSchema: {
+        ...turnReferenceInput(contract),
+        step_summary: z.string().min(1).max(500_000).describe("Full answer or summary of what was accomplished in this step"),
+      },
+      outputSchema: {
+        has_next: z.boolean(),
+        workspace: z.string().optional(),
+        next_task: z.string().optional(),
+        remaining_tasks: z.number().int().nonnegative().optional(),
+        message: z.string().optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (input, extra) => withClaimedTurn(
+      "codex_fetch_next_task",
+      turnReference(contract, input),
+      extra,
+      async claimed => {
+        const { step_summary } = input as { step_summary: string };
+        const cwd = claimed.environment.cwd;
+        const defaultWorkspace = "D:\\Project\\Workspace";
+        let activeDir = cwd;
+        if (!existsSync(join(activeDir, "TASKS.txt")) && existsSync(join(defaultWorkspace, "TASKS.txt"))) {
+          activeDir = defaultWorkspace;
+        }
+        const tasksPath = join(activeDir, "TASKS.txt");
+        const responsePath = join(activeDir, "RESPONSE.md");
+
+        const isInternalPoll = step_summary === "__POLL__" || step_summary?.startsWith("__POLL__");
+        if (!isInternalPoll) {
+          try {
+            const timeStr = new Date().toLocaleTimeString();
+            const report = `\n\n### 阶段汇报 [${timeStr}]\n${step_summary}\n`;
+            appendFileSync(responsePath, report, "utf8");
+            if (activeDir !== cwd && existsSync(cwd)) {
+              try { appendFileSync(join(cwd, "RESPONSE.md"), report, "utf8"); } catch {}
+            }
+          } catch (err) {
+            console.error(`[chatgpt-web-mcp] failed to write response file: ${err}`);
+          }
+        }
+
+        // 60-second bounded wait to stay safely below tunnel-client's 120-second command deadline.
+        const WAIT_TIMEOUT_MS = 60_000;
+        const startWait = Date.now();
+
+        while (!extra.signal?.aborted && (Date.now() - startWait < WAIT_TIMEOUT_MS)) {
+          try {
+            if (existsSync(tasksPath)) {
+              const raw = readFileSync(tasksPath, "utf8");
+              const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+              if (lines.length > 0) {
+                const nextTask = lines.shift()!;
+                writeFileSync(tasksPath, lines.join("\n") + (lines.length > 0 ? "\n" : ""), "utf8");
+                if (nextTask === "/exit" || nextTask === "__FINISH__") {
+                  return result({
+                    has_next: false,
+                    message: "User explicitly commanded /exit. Please summarize all completed work and conclude your response cleanly.",
+                  });
+                }
+                return result({
+                  has_next: true,
+                  workspace: activeDir,
+                  next_task: nextTask,
+                  remaining_tasks: lines.length,
+                  message: `New instruction from user: '${nextTask}'. Target workspace is '${activeDir}'. Please execute it, put your complete answer in step_summary, and call this tool again when finished.`,
+                });
+              }
+            }
+          } catch (e) {
+            // Transient NTFS file lock contention; self-heals on next 500ms poll
+          }
+          await new Promise(r => setTimeout(r, 500));
+        }
+
+        if (extra.signal?.aborted) {
+          return result({
+            has_next: false,
+            message: "Turn ended by client abort.",
+          });
+        }
+
+        // 60s expired with no task: safely return short-chain heartbeat so model immediately re-calls this tool.
+        return result({
+          has_next: true,
+          next_task: "__POLL__",
+          message: "No new instruction from user yet (user is still preparing input). DO NOT output text to user. Immediately call codex_fetch_next_task again with step_summary='__POLL__' to continue waiting silently.",
+        });
+      },
+    ),
   );
 
   if (contract === "safe") {
