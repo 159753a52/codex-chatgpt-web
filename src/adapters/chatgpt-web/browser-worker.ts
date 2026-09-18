@@ -55,6 +55,7 @@ import {
   CHATGPT_EFFORT_ITEM_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   CHATGPT_STOP_BUTTON_SELECTOR,
+  CHATGPT_TARGET_CHAT_URL,
   CHATGPT_TEMPORARY_CHAT_URL,
   CHATGPT_USER_TURN_SELECTOR,
   activateChatGptEffortMenu,
@@ -2208,7 +2209,7 @@ export class ChatGptBrowserWorker {
 
   inspectSession(detectCapabilities: boolean): Promise<{
     authenticated: true;
-    temporary: true;
+    temporary: boolean;
     url: string;
     solAvailable?: boolean;
     extraHighAvailable?: boolean;
@@ -2540,12 +2541,14 @@ export class ChatGptBrowserWorker {
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
-    if (page.url() !== CHATGPT_TEMPORARY_CHAT_URL) {
-      await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
+    const currentUrl = page.url();
+    const isAlreadyOnChatPage = currentUrl.startsWith("https://chatgpt.com/c/") || currentUrl === CHATGPT_TARGET_CHAT_URL || (currentUrl.startsWith("https://chatgpt.com/") && !currentUrl.includes("login"));
+    if (!isAlreadyOnChatPage) {
+      await page.goto(CHATGPT_TARGET_CHAT_URL, {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
       });
-      await captureDiagnostic?.("temporary-chat-navigation-complete");
+      await captureDiagnostic?.("chat-navigation-complete");
     }
     let composer: Locator;
     try {
@@ -3689,7 +3692,7 @@ export class ChatGptBrowserWorker {
 
   private async inspectSessionExclusive(detectCapabilities: boolean): Promise<{
     authenticated: true;
-    temporary: true;
+    temporary: boolean;
     url: string;
     solAvailable?: boolean;
     extraHighAvailable?: boolean;
@@ -3698,9 +3701,10 @@ export class ChatGptBrowserWorker {
     const page = await this.ensurePage();
     await this.prepareTemporaryChatSurface(page);
     const url = page.url();
-    if (!detectCapabilities) return { authenticated: true, temporary: true, url };
+    const temporary = page.url().includes("temporary-chat=true");
+    if (!detectCapabilities) return { authenticated: true, temporary, url };
     const capabilities = await detectChatGptAccountCapabilities(page);
-    return { authenticated: true, temporary: true, url, ...capabilities };
+    return { authenticated: true, temporary, url, ...capabilities };
   }
 
   private async smokeTestExclusive(abortSignal?: AbortSignal): Promise<{ effort: string; response: string }> {
