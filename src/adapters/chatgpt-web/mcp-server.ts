@@ -50,7 +50,7 @@ export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 90_000;
 const ZERO_RISK_MCP_INSTRUCTIONS = [
   "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id in its request block.",
   "Use that request_id with the Codex tools needed for the task.",
-  "After completing any work or answering any question, you MUST put your complete answer into step_summary and call codex_fetch_next_task (passing session_id if given) to report it to the user. If next_task is '__POLL__', immediately call codex_fetch_next_task again with step_summary='__POLL__' to stay waiting. You MUST NEVER end this turn or conclude your response until codex_fetch_next_task returns has_next=false (which only happens on user /exit).",
+  "After completing any work or answering any question, you MUST put your complete answer into step_summary and call codex_fetch_next_task (always passing session_id if assigned) to report it to the user. If next_task is '__POLL__', immediately call codex_fetch_next_task again with the same session_id and step_summary='__POLL__' to stay waiting. You MUST NEVER end this turn or conclude your response until codex_fetch_next_task returns has_next=false (which only happens on user /exit).",
   "When the user signals /exit (has_next=false), send the complete answer with codex_turn_complete.",
   "If a tool returns an error, report that error instead of changing the request_id.",
 ].join(" ");
