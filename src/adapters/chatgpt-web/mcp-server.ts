@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -50,7 +50,7 @@ export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 90_000;
 const ZERO_RISK_MCP_INSTRUCTIONS = [
   "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id in its request block.",
   "Use that request_id with the Codex tools needed for the task.",
-  "After completing any work or answering any question, you MUST put your complete answer into step_summary and call codex_fetch_next_task to report it to the user. If next_task is '__POLL__', immediately call codex_fetch_next_task again with step_summary='__POLL__' to stay waiting. You MUST NEVER end this turn or conclude your response until codex_fetch_next_task returns has_next=false (which only happens on user /exit).",
+  "After completing any work or answering any question, you MUST put your complete answer into step_summary and call codex_fetch_next_task (passing session_id if given) to report it to the user. If next_task is '__POLL__', immediately call codex_fetch_next_task again with step_summary='__POLL__' to stay waiting. You MUST NEVER end this turn or conclude your response until codex_fetch_next_task returns has_next=false (which only happens on user /exit).",
   "When the user signals /exit (has_next=false), send the complete answer with codex_turn_complete.",
   "If a tool returns an error, report that error instead of changing the request_id.",
 ].join(" ");
@@ -929,6 +929,44 @@ export async function runChatGptMcpServer(options: {
     },
   );
 
+  const turnSessionMap = new Map<string, string>();
+
+  function safeReadFile(filePath: string, maxRetries = 3): string | null {
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        if (existsSync(filePath)) return readFileSync(filePath, "utf8");
+        return null;
+      } catch {
+        if (i === maxRetries - 1) return null;
+      }
+    }
+    return null;
+  }
+
+  function safeWriteFile(filePath: string, content: string, maxRetries = 3): boolean {
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        writeFileSync(filePath, content, "utf8");
+        return true;
+      } catch {
+        if (i === maxRetries - 1) return false;
+      }
+    }
+    return false;
+  }
+
+  function safeAppendFile(filePath: string, content: string, maxRetries = 3): boolean {
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        appendFileSync(filePath, content, "utf8");
+        return true;
+      } catch {
+        if (i === maxRetries - 1) return false;
+      }
+    }
+    return false;
+  }
+
   server.registerTool(
     "codex_fetch_next_task",
     {
@@ -936,10 +974,12 @@ export async function runChatGptMcpServer(options: {
       description: afterSafeStart(contract, "Report current subtask progress/response and wait for user instructions without ending this turn. IMPORTANT: Put your full and complete answer for the user directly into step_summary so it is recorded in the local workspace. If has_next is true and next_task is '__POLL__', immediately call this tool again with step_summary='__POLL__' to continue waiting silently. If next_task is a real task, execute it. You MUST NOT end this turn until has_next is false (when user signals /exit)."),
       inputSchema: {
         ...turnReferenceInput(contract),
+        session_id: z.string().optional().describe("Optional session identifier (e.g. 'default', 'sess_xxx'). Defaults to current turn's locked session or 'default'"),
         step_summary: z.string().min(1).max(500_000).describe("Full answer or summary of what was accomplished in this step"),
       },
       outputSchema: {
         has_next: z.boolean(),
+        session_id: z.string().optional(),
         workspace: z.string().optional(),
         next_task: z.string().optional(),
         remaining_tasks: z.number().int().nonnegative().optional(),
@@ -952,13 +992,47 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
-        const { step_summary } = input as { step_summary: string };
+        const { step_summary } = input as { step_summary: string; session_id?: string };
+        const inputSessionId = (input as { session_id?: string }).session_id;
+
+        // Session Pinning & Sanitization
+        let targetSessionId = "";
+        if (typeof inputSessionId === "string" && inputSessionId.trim()) {
+          const clean = inputSessionId.trim().replace(/[^a-zA-Z0-9_-]/g, "");
+          const isReserved = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(clean);
+          if (clean && !isReserved) {
+            targetSessionId = clean;
+            turnSessionMap.set(claimed.bindingId, targetSessionId);
+          }
+        } else if (turnSessionMap.has(claimed.bindingId)) {
+          // Sticky Session Affinity
+          targetSessionId = turnSessionMap.get(claimed.bindingId)!;
+        }
+
+        if (!targetSessionId) {
+          targetSessionId = "default";
+          turnSessionMap.set(claimed.bindingId, targetSessionId);
+        }
+
         const cwd = claimed.environment.cwd;
         const defaultWorkspace = "D:\\Project\\Workspace";
-        let activeDir = cwd;
-        if (!existsSync(join(activeDir, "TASKS.txt")) && existsSync(join(defaultWorkspace, "TASKS.txt"))) {
-          activeDir = defaultWorkspace;
+        let activeDir = defaultWorkspace;
+
+        if (targetSessionId === "default") {
+          const sessionDefaultDir = join(defaultWorkspace, "sessions", "default");
+          if (existsSync(sessionDefaultDir)) {
+            activeDir = sessionDefaultDir;
+          } else if (existsSync(join(defaultWorkspace, "TASKS.txt"))) {
+            activeDir = defaultWorkspace;
+          } else {
+            activeDir = sessionDefaultDir;
+            try { mkdirSync(activeDir, { recursive: true }); } catch {}
+          }
+        } else {
+          activeDir = join(defaultWorkspace, "sessions", targetSessionId);
+          try { mkdirSync(activeDir, { recursive: true }); } catch {}
         }
+
         const tasksPath = join(activeDir, "TASKS.txt");
         const responsePath = join(activeDir, "RESPONSE.md");
 
@@ -967,9 +1041,10 @@ export async function runChatGptMcpServer(options: {
           try {
             const timeStr = new Date().toLocaleTimeString();
             const report = `\n\n### 阶段汇报 [${timeStr}]\n${step_summary}\n`;
-            appendFileSync(responsePath, report, "utf8");
-            if (activeDir !== cwd && existsSync(cwd)) {
-              try { appendFileSync(join(cwd, "RESPONSE.md"), report, "utf8"); } catch {}
+            safeAppendFile(responsePath, report);
+            // Backward-compat dual-write for legacy default workspace root if applicable
+            if (targetSessionId === "default" && activeDir !== defaultWorkspace && existsSync(defaultWorkspace)) {
+              try { safeAppendFile(join(defaultWorkspace, "RESPONSE.md"), report); } catch {}
             }
           } catch (err) {
             console.error(`[chatgpt-web-mcp] failed to write response file: ${err}`);
@@ -982,24 +1057,26 @@ export async function runChatGptMcpServer(options: {
 
         while (!extra.signal?.aborted && (Date.now() - startWait < WAIT_TIMEOUT_MS)) {
           try {
-            if (existsSync(tasksPath)) {
-              const raw = readFileSync(tasksPath, "utf8");
+            const raw = safeReadFile(tasksPath);
+            if (raw !== null) {
               const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
               if (lines.length > 0) {
                 const nextTask = lines.shift()!;
-                writeFileSync(tasksPath, lines.join("\n") + (lines.length > 0 ? "\n" : ""), "utf8");
+                safeWriteFile(tasksPath, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
                 if (nextTask === "/exit" || nextTask === "__FINISH__") {
                   return result({
                     has_next: false,
-                    message: "User explicitly commanded /exit. Please summarize all completed work and conclude your response cleanly.",
+                    session_id: targetSessionId,
+                    message: `User explicitly commanded /exit for session '${targetSessionId}'. Please summarize all completed work and conclude your response cleanly.`,
                   });
                 }
                 return result({
                   has_next: true,
+                  session_id: targetSessionId,
                   workspace: activeDir,
                   next_task: nextTask,
                   remaining_tasks: lines.length,
-                  message: `New instruction from user: '${nextTask}'. Target workspace is '${activeDir}'. Please execute it, put your complete answer in step_summary, and call this tool again when finished.`,
+                  message: `New instruction from user: '${nextTask}'. Target session is '${targetSessionId}', target workspace is '${activeDir}'. Please execute it, put your complete answer in step_summary, and call this tool again when finished.`,
                 });
               }
             }
@@ -1012,6 +1089,7 @@ export async function runChatGptMcpServer(options: {
         if (extra.signal?.aborted) {
           return result({
             has_next: false,
+            session_id: targetSessionId,
             message: "Turn ended by client abort.",
           });
         }
@@ -1019,8 +1097,9 @@ export async function runChatGptMcpServer(options: {
         // 60s expired with no task: safely return short-chain heartbeat so model immediately re-calls this tool.
         return result({
           has_next: true,
+          session_id: targetSessionId,
           next_task: "__POLL__",
-          message: "No new instruction from user yet (user is still preparing input). DO NOT output text to user. Immediately call codex_fetch_next_task again with step_summary='__POLL__' to continue waiting silently.",
+          message: `No new instruction from user yet for session '${targetSessionId}' (user is still preparing input). DO NOT output text to user. Immediately call codex_fetch_next_task again with session_id='${targetSessionId}', step_summary='__POLL__' to continue waiting silently.`,
         });
       },
     ),
