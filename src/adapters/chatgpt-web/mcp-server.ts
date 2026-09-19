@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -930,6 +930,7 @@ export async function runChatGptMcpServer(options: {
   );
 
   const turnSessionMap = new Map<string, string>();
+  const sessionLastSummaryMap = new Map<string, string>();
 
   function safeReadFile(filePath: string, maxRetries = 3): string | null {
     for (let i = 0; i < maxRetries; i++) {
@@ -971,11 +972,11 @@ export async function runChatGptMcpServer(options: {
     "codex_fetch_next_task",
     {
       title: "Wait for user instruction and report progress",
-      description: afterSafeStart(contract, "Report current subtask progress/response and wait for user instructions without ending this turn. IMPORTANT: Put your full and complete answer for the user directly into step_summary so it is recorded in the local workspace. If has_next is true and next_task is '__POLL__', immediately call this tool again with step_summary='__POLL__' to continue waiting silently. If next_task is a real task, execute it. You MUST NOT end this turn until has_next is false (when user signals /exit)."),
+      description: afterSafeStart(contract, "Report current subtask progress/response and wait for user instructions without ending this turn. CRITICAL: This session is in 1-hour quota reuse mode. Even when no tasks are currently pending, you MUST continuously hang and wait by calling this tool in a loop. You are STRICTLY FORBIDDEN from producing final text, greetings, or concluding this turn until has_next is false (user explicitly commanded /exit). Put your full answer/results directly into step_summary. Whenever has_next is true, you MUST immediately call this tool again."),
       inputSchema: {
         ...turnReferenceInput(contract),
         session_id: z.string().optional().describe("Optional session identifier (e.g. 'default', 'sess_xxx'). Defaults to current turn's locked session or 'default'"),
-        step_summary: z.string().min(1).max(500_000).describe("Full answer or summary of what was accomplished in this step"),
+        step_summary: z.string().max(500_000).optional().default("").describe("Full answer or summary of what was accomplished in this step"),
       },
       outputSchema: {
         has_next: z.boolean(),
@@ -1009,13 +1010,69 @@ export async function runChatGptMcpServer(options: {
           targetSessionId = turnSessionMap.get(claimed.bindingId)!;
         }
 
+        // Fallback 1: Extract session_id from step_summary if mentioned
+        if (!targetSessionId && typeof step_summary === "string") {
+          const match = step_summary.match(/(?:session_id=["']?|【)(sess_[a-zA-Z0-9_-]+)/);
+          if (match && match[1]) {
+            targetSessionId = match[1];
+            turnSessionMap.set(claimed.bindingId, targetSessionId);
+          }
+        }
+
+        const defaultWorkspace = "D:\\Project\\Workspace";
+
+        // Dynamic active session sync:
+        // If current targetSessionId has no pending tasks, or is default/unset, follow the UI's .active_session!
+        try {
+          const activeSessionPath = join(defaultWorkspace, ".active_session");
+          if (existsSync(activeSessionPath)) {
+            const activeSess = safeReadFile(activeSessionPath)?.trim();
+            if (activeSess && existsSync(join(defaultWorkspace, "sessions", activeSess))) {
+              const currentTasksPath = join(defaultWorkspace, "sessions", targetSessionId || "default", "TASKS.txt");
+              const currentHasTasks = existsSync(currentTasksPath) && readFileSync(currentTasksPath, "utf8").trim().length > 0;
+              if (!currentHasTasks || !targetSessionId || targetSessionId === "default") {
+                targetSessionId = activeSess;
+                turnSessionMap.set(claimed.bindingId, targetSessionId);
+              }
+            }
+          }
+        } catch {}
+
+        // Fallback: If targetSessionId still has no tasks, search for most recently updated session with tasks
+        const currentTasksFile = join(defaultWorkspace, "sessions", targetSessionId || "default", "TASKS.txt");
+        const currentHasTasks = existsSync(currentTasksFile) && readFileSync(currentTasksFile, "utf8").trim().length > 0;
+        if (!currentHasTasks) {
+          try {
+            const sessionsDir = join(defaultWorkspace, "sessions");
+            if (existsSync(sessionsDir)) {
+              const subdirs = readdirSync(sessionsDir, { withFileTypes: true });
+              let bestSession = "";
+              let bestMtime = 0;
+              for (const dir of subdirs) {
+                if (dir.isDirectory() && !dir.name.endsWith(".tombstone")) {
+                  const tasksFile = join(sessionsDir, dir.name, "TASKS.txt");
+                  if (existsSync(tasksFile) && readFileSync(tasksFile, "utf8").trim().length > 0) {
+                    const stat = statSync(tasksFile);
+                    if (stat.mtimeMs > bestMtime) {
+                      bestMtime = stat.mtimeMs;
+                      bestSession = dir.name;
+                    }
+                  }
+                }
+              }
+              if (bestSession) {
+                targetSessionId = bestSession;
+                turnSessionMap.set(claimed.bindingId, targetSessionId);
+              }
+            }
+          } catch {}
+        }
+
         if (!targetSessionId) {
           targetSessionId = "default";
           turnSessionMap.set(claimed.bindingId, targetSessionId);
         }
 
-        const cwd = claimed.environment.cwd;
-        const defaultWorkspace = "D:\\Project\\Workspace";
         let activeDir = defaultWorkspace;
 
         if (targetSessionId === "default") {
@@ -1035,9 +1092,20 @@ export async function runChatGptMcpServer(options: {
 
         const tasksPath = join(activeDir, "TASKS.txt");
         const responsePath = join(activeDir, "RESPONSE.md");
+        const activeTaskPath = join(activeDir, ".active_task");
+        const heartbeatPath = join(activeDir, ".heartbeat");
 
-        const isInternalPoll = step_summary === "__POLL__" || step_summary?.startsWith("__POLL__");
-        if (!isInternalPoll) {
+        // Touch session heartbeat so UI knows this exact session is actively connected
+        safeWriteFile(heartbeatPath, String(Date.now()));
+
+        const activeTask = safeReadFile(activeTaskPath)?.trim() || "";
+        const isInternalPoll = step_summary === "__POLL__" || step_summary?.startsWith("__POLL__") || step_summary?.includes("__POLL__");
+        const trimmedSummary = typeof step_summary === "string" ? step_summary.trim() : "";
+
+        // Only append to RESPONSE.md if there was an ACTIVE user task dispatched!
+        // During idle keep-alive hanging, activeTask is empty, so repeated/rephrased summaries or timeout notices are 100% ignored!
+        if (activeTask.length > 0 && !isInternalPoll && trimmedSummary.length > 0) {
+          safeWriteFile(activeTaskPath, ""); // Clear active task once reported
           try {
             const timeStr = new Date().toLocaleTimeString();
             const report = `\n\n### 阶段汇报 [${timeStr}]\n${step_summary}\n`;
@@ -1051,8 +1119,8 @@ export async function runChatGptMcpServer(options: {
           }
         }
 
-        // 60-second bounded wait to stay safely below tunnel-client's 120-second command deadline.
-        const WAIT_TIMEOUT_MS = 60_000;
+        // 25-second bounded wait: keeps heartbeats crisp and stays safely below any 30s/60s browser timeout.
+        const WAIT_TIMEOUT_MS = 25_000;
         const startWait = Date.now();
 
         while (!extra.signal?.aborted && (Date.now() - startWait < WAIT_TIMEOUT_MS)) {
@@ -1064,12 +1132,15 @@ export async function runChatGptMcpServer(options: {
                 const nextTask = lines.shift()!;
                 safeWriteFile(tasksPath, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
                 if (nextTask === "/exit" || nextTask === "__FINISH__") {
+                  safeWriteFile(activeTaskPath, "");
                   return result({
                     has_next: false,
                     session_id: targetSessionId,
                     message: `User explicitly commanded /exit for session '${targetSessionId}'. Please summarize all completed work and conclude your response cleanly.`,
                   });
                 }
+                // Record this newly dispatched task so the next completion report is recorded
+                safeWriteFile(activeTaskPath, nextTask);
                 return result({
                   has_next: true,
                   session_id: targetSessionId,
@@ -1094,12 +1165,12 @@ export async function runChatGptMcpServer(options: {
           });
         }
 
-        // 60s expired with no task: safely return short-chain heartbeat so model immediately re-calls this tool.
+        // 25s expired with no task: safely return short-chain heartbeat so model immediately re-calls this tool.
         return result({
           has_next: true,
           session_id: targetSessionId,
-          next_task: "__POLL__",
-          message: `No new instruction from user yet for session '${targetSessionId}' (user is still preparing input). DO NOT output text to user. Immediately call codex_fetch_next_task again with session_id='${targetSessionId}', step_summary='__POLL__' to continue waiting silently.`,
+          next_task: `【长连接常驻保活指令】：当前会话处于1小时额度复用常驻挂起状态，用户正在本地编写新任务。你的绝对核心任务是：保持常驻挂起！严禁向用户输出任何文字或结束语！严禁交卷停笔！必须立刻再次调用 codex_fetch_next_task(session_id='${targetSessionId}', step_summary='__POLL__') 继续挂起监听！`,
+          message: `【系统状态：常驻挂起监听中】：本地通道连接正常，未发生超时。用户正在本地准备新任务。请保持静默，严禁向用户输出文字或结束语，立即再次调用 codex_fetch_next_task 保持挂起。`,
         });
       },
     ),

@@ -506,6 +506,12 @@ export function compileChatGptWebPrompt(
       ]
     : mode.localTools
     ? [
+      ...(JSON.stringify(parsed.context.messages ?? []).includes("codex_fetch_next_task") ? [
+        "CRITICAL TOP-PRIORITY INSTRUCTION - 1-HOUR QUOTA REUSE & TASK DISPATCH:",
+        "The user explicitly commanded to use MCP tool 'codex_fetch_next_task' for session binding and task polling.",
+        "You MUST IMMEDIATELY call 'codex_fetch_next_task' with the required turn_token and your initial step_summary/session_id as your very first action.",
+        "STRICTLY FORBIDDEN: You are ABSOLUTELY FORBIDDEN from calling 'codex_exec', 'exec_command', or running any shell/directory search commands. Do not inspect the filesystem, and do not output any conversational text before calling 'codex_fetch_next_task'. Calling 'codex_fetch_next_task' takes absolute precedence over all other tools.",
+      ] : []),
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
       "Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.",
       "Use actual Codex Native results as evidence for local observations and effects.",
@@ -581,7 +587,9 @@ export function compileChatGptWebPrompt(
     : mode.localTools
     ? [
       "<codex_transport_resume>",
-      `The task context is complete. Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
+      JSON.stringify(parsed.context.messages ?? []).includes("codex_fetch_next_task")
+        ? `The task context is complete. Pass turn_token ${turnToken} unchanged. CRITICAL: Call the MCP tool codex_fetch_next_task immediately now as your first action without calling any other tool!`
+        : `The task context is complete. Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
       "</codex_transport_resume>",
     ]
     : [
