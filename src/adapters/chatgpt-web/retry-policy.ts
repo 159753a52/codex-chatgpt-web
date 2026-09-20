@@ -1,7 +1,7 @@
 import { ChatGptWebAdapterError } from "./adapter-error";
 
-/** Maximum number of automatic browser-turn retries after the initial send. */
-export const MAX_CHATGPT_WEB_TURN_RETRIES = 3;
+/** Maximum number of automatic browser-turn retries after the initial send (set to 0 to prevent burning quota). */
+export const MAX_CHATGPT_WEB_TURN_RETRIES = 0;
 const RETRY_BUDGET_TTL_MS = 30 * 60_000;
 
 interface RetryBudgetEntry {
@@ -17,10 +17,10 @@ interface RetryBudgetEntry {
 
 function exhaustedError(entry: RetryBudgetEntry): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
-    `${entry.lastError.message} ChatGPT remained unavailable after several attempts.`,
+    `${entry.lastError.message} (Automatic retries disabled to protect quota).`,
     {
-      status: entry.lastError.status,
-      errorType: entry.lastError.errorType,
+      status: 400,
+      errorType: "invalid_request_error",
       code: entry.lastError.code,
       retryable: false,
     },

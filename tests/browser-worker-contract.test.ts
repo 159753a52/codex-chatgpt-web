@@ -2593,17 +2593,17 @@ test("unrelated ChatGPT dialogs are left untouched", async () => {
   expect(fixture.pressed).toEqual([]);
 });
 
-test("the known terminal ChatGPT error alert returns a structured retryable failure", async () => {
+test("the known terminal ChatGPT error alert returns a structured non-retryable failure", async () => {
   const fixture = dialogPage(
     "Something went wrong. If this issue persists please contact us through our help center at help.openai.com.",
   );
 
   await expect(throwIfChatGptTerminalErrorAlert(fixture.page)).rejects.toMatchObject({
     name: "ChatGptWebAdapterError",
-    status: 502,
-    errorType: "server_error",
+    status: 400,
+    errorType: "invalid_request_error",
     code: "upstream_server_error",
-    retryable: true,
+    retryable: false,
   });
   expect(fixture.pressed).toEqual([]);
 });

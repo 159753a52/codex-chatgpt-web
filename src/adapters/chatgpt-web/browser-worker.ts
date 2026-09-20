@@ -808,14 +808,14 @@ const chatGptTerminalErrorAlert = (scope: ChatGptTextScope): Locator => scope
 export async function throwIfChatGptTerminalErrorAlert(scope: ChatGptTextScope): Promise<void> {
   if (await scope.getByTestId("regenerate-thread-error-button").last().isVisible().catch(() => false)) {
     throw new ChatGptWebAdapterError(
-      "ChatGPT displayed an error for this response. Check the ChatGPT tab for the exact error, then retry the turn.",
-      { status: 502, errorType: "server_error", code: "upstream_server_error", retryable: true },
+      "ChatGPT displayed an error for this response. Check the ChatGPT tab for the exact error, then retry manually if desired.",
+      { status: 400, errorType: "invalid_request_error", code: "upstream_server_error", retryable: false },
     );
   }
   if (!await chatGptTerminalErrorAlert(scope).isVisible().catch(() => false)) return;
   throw new ChatGptWebAdapterError(
-    "ChatGPT ended the turn with 'Something went wrong'. Retry the turn.",
-    { status: 502, errorType: "server_error", code: "upstream_server_error", retryable: true },
+    "ChatGPT ended the turn with 'Something went wrong'. Retry manually if desired.",
+    { status: 400, errorType: "invalid_request_error", code: "upstream_server_error", retryable: false },
   );
 }
 
@@ -1452,20 +1452,23 @@ export class ChatGptCompletionTracker {
       this.missingPostToolAnswerSince = undefined;
       return false;
     }
+    const isComplete = chatGptTurnIsComplete(state) || (state.responsePresent && !state.running);
+
     if (this.postToolAnswerBaselineText === state.currentText) {
-      this.candidate = undefined;
-      if (!chatGptTurnIsComplete(state)) {
+      if (!isComplete) {
+        this.candidate = undefined;
         this.missingPostToolAnswerSince = undefined;
         return false;
       }
-      this.missingPostToolAnswerSince ??= now;
-      if (now - this.missingPostToolAnswerSince >= this.missingPostToolAnswerMs) {
-        throw new Error("ChatGPT completed without producing a final answer after its last Codex tool call");
+      if (this.candidate?.signature !== signature) {
+        this.candidate = { signature, since: now };
+        return false;
       }
-      return false;
+      return now - this.candidate.since >= this.stableMs;
     }
+
     this.missingPostToolAnswerSince = undefined;
-    if (!chatGptTurnIsComplete(state)) {
+    if (!isComplete) {
       this.candidate = undefined;
       return false;
     }
