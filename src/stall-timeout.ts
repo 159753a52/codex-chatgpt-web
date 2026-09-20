@@ -2,13 +2,13 @@
  * Bridge upstream stall budget: seconds of silence (no adapter events) before the
  * Responses bridge emits `response.incomplete` / `upstream_stall_timeout`.
  *
- * Raised from 90s so long reasoning + large tool writes are not cut mid-turn.
- * Hung streams still die; they just get a more realistic window.
+ * Set to 10 minutes so a hung browser/WebSocket turn is detected and surfaced
+ * within a realistic window, rather than waiting for the full turn timeout.
  */
-export const DEFAULT_STALL_TIMEOUT_SEC = 86_400;
+export const DEFAULT_STALL_TIMEOUT_SEC = 600;
 
 // Keep a malformed or accidentally enormous configuration within a practical recovery budget.
-export const MAX_STALL_TIMEOUT_SEC = 86_400;
+export const MAX_STALL_TIMEOUT_SEC = 3_600;
 
 /**
  * Resolve the effective bridge stall deadline for a turn.

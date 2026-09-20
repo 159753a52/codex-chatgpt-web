@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -794,7 +794,22 @@ export async function runChatGptMcpServer(options: {
         const { query, offset, limit, include_schema } = input;
         const bound = claimed.environment;
         const needle = query?.trim().toLowerCase();
-        const directMatches = safeVisibleTools(bound, contract).filter(tool => !needle || [
+        const baseTools = safeVisibleTools(bound, contract);
+        const extraMcpTools: CodexTool[] = [
+          {
+            name: "codex_fetch_next_task",
+            description: "Wait for user instruction and report progress in 1-hour quota reuse mode.",
+            parameters: {
+              type: "object",
+              properties: {
+                session_id: { type: "string", description: "Optional session identifier" },
+                step_summary: { type: "string", description: "Full answer or summary of what was accomplished in this step" },
+              },
+            },
+          },
+        ];
+        const combinedTools = [...baseTools, ...extraMcpTools];
+        const directMatches = combinedTools.filter(tool => !needle || [
           wireName(tool),
           tool.name,
           tool.namespace ?? "",
@@ -931,6 +946,20 @@ export async function runChatGptMcpServer(options: {
 
   const turnSessionMap = new Map<string, string>();
   const sessionLastSummaryMap = new Map<string, string>();
+  const turnStartedMarked = new Set<string>();
+
+  const DEFAULT_WORKSPACE = "D:\\Project\\Workspace";
+  const WORKSPACE_POINTER_PATH = join(DEFAULT_WORKSPACE, ".workspace_pointer");
+
+  function resolveWorkspace(): string {
+    try {
+      if (existsSync(WORKSPACE_POINTER_PATH)) {
+        const p = readFileSync(WORKSPACE_POINTER_PATH, "utf8").trim();
+        if (p && existsSync(p)) return p;
+      }
+    } catch {}
+    return DEFAULT_WORKSPACE;
+  }
 
   function safeReadFile(filePath: string, maxRetries = 3): string | null {
     for (let i = 0; i < maxRetries; i++) {
@@ -966,6 +995,46 @@ export async function runChatGptMcpServer(options: {
       }
     }
     return false;
+  }
+
+  function parseTaskLine(line: string): { id: string; content: string } {
+    const sep = line.indexOf("|");
+    if (sep > 0 && /^[a-zA-Z0-9]+$/.test(line.slice(0, sep))) {
+      return { id: line.slice(0, sep), content: line.slice(sep + 1) };
+    }
+    return { id: "", content: line };
+  }
+
+  function tryAcquirePopLock(dir: string): number | null {
+    const lockPath = join(dir, ".pop_lock");
+    try {
+      const fd = openSync(lockPath, "wx");
+      return fd;
+    } catch {
+      // Reclaim a stale lock left behind by a crashed process (older than 60s).
+      try {
+        const st = statSync(lockPath);
+        if (Date.now() - st.mtimeMs > 60_000) {
+          unlinkSync(lockPath);
+          return openSync(lockPath, "wx");
+        }
+      } catch {}
+      return null;
+    }
+  }
+
+  function releasePopLock(dir: string, fd: number): void {
+    try {
+      closeSync(fd);
+    } catch {}
+    try {
+      unlinkSync(join(dir, ".pop_lock"));
+    } catch {}
+  }
+
+  function getTaskLineId(line: string): string {
+    const sep = line.indexOf("|");
+    return sep > 0 ? line.slice(0, sep) : "";
   }
 
   server.registerTool(
@@ -1019,50 +1088,17 @@ export async function runChatGptMcpServer(options: {
           }
         }
 
-        const defaultWorkspace = "D:\\Project\\Workspace";
+        const defaultWorkspace = resolveWorkspace();
 
-        // Dynamic active session sync:
-        // If current targetSessionId has no pending tasks, or is default/unset, follow the UI's .active_session!
-        try {
-          const activeSessionPath = join(defaultWorkspace, ".active_session");
-          if (existsSync(activeSessionPath)) {
-            const activeSess = safeReadFile(activeSessionPath)?.trim();
-            if (activeSess && existsSync(join(defaultWorkspace, "sessions", activeSess))) {
-              const currentTasksPath = join(defaultWorkspace, "sessions", targetSessionId || "default", "TASKS.txt");
-              const currentHasTasks = existsSync(currentTasksPath) && readFileSync(currentTasksPath, "utf8").trim().length > 0;
-              if (!currentHasTasks || !targetSessionId || targetSessionId === "default") {
-                targetSessionId = activeSess;
-                turnSessionMap.set(claimed.bindingId, targetSessionId);
-              }
-            }
-          }
-        } catch {}
-
-        // Fallback: If targetSessionId still has no tasks, search for most recently updated session with tasks
-        const currentTasksFile = join(defaultWorkspace, "sessions", targetSessionId || "default", "TASKS.txt");
-        const currentHasTasks = existsSync(currentTasksFile) && readFileSync(currentTasksFile, "utf8").trim().length > 0;
-        if (!currentHasTasks) {
+        // Session fallback: ONLY if no target session was explicitly specified in arguments,
+        // sticky affinity, or step_summary, fall back to UI's .active_session or "default".
+        if (!targetSessionId) {
           try {
-            const sessionsDir = join(defaultWorkspace, "sessions");
-            if (existsSync(sessionsDir)) {
-              const subdirs = readdirSync(sessionsDir, { withFileTypes: true });
-              let bestSession = "";
-              let bestMtime = 0;
-              for (const dir of subdirs) {
-                if (dir.isDirectory() && !dir.name.endsWith(".tombstone")) {
-                  const tasksFile = join(sessionsDir, dir.name, "TASKS.txt");
-                  if (existsSync(tasksFile) && readFileSync(tasksFile, "utf8").trim().length > 0) {
-                    const stat = statSync(tasksFile);
-                    if (stat.mtimeMs > bestMtime) {
-                      bestMtime = stat.mtimeMs;
-                      bestSession = dir.name;
-                    }
-                  }
-                }
-              }
-              if (bestSession) {
-                targetSessionId = bestSession;
-                turnSessionMap.set(claimed.bindingId, targetSessionId);
+            const activeSessionPath = join(defaultWorkspace, ".active_session");
+            if (existsSync(activeSessionPath)) {
+              const activeSess = safeReadFile(activeSessionPath)?.trim();
+              if (activeSess && existsSync(join(defaultWorkspace, "sessions", activeSess))) {
+                targetSessionId = activeSess;
               }
             }
           } catch {}
@@ -1070,7 +1106,18 @@ export async function runChatGptMcpServer(options: {
 
         if (!targetSessionId) {
           targetSessionId = "default";
-          turnSessionMap.set(claimed.bindingId, targetSessionId);
+        }
+        turnSessionMap.set(claimed.bindingId, targetSessionId);
+
+        // Mark the start of this turn for 6pro-agent's 1h timeout detection (only once per binding).
+        if (!turnStartedMarked.has(claimed.bindingId)) {
+          turnStartedMarked.add(claimed.bindingId);
+          const sessionDir = targetSessionId === "default"
+            ? join(defaultWorkspace, "sessions", "default")
+            : join(defaultWorkspace, "sessions", targetSessionId);
+          try {
+            safeWriteFile(join(sessionDir, ".turn_started"), String(Date.now()));
+          } catch {}
         }
 
         let activeDir = defaultWorkspace;
@@ -1099,8 +1146,8 @@ export async function runChatGptMcpServer(options: {
         safeWriteFile(heartbeatPath, String(Date.now()));
 
         const activeTask = safeReadFile(activeTaskPath)?.trim() || "";
-        const isInternalPoll = step_summary === "__POLL__" || step_summary?.startsWith("__POLL__") || step_summary?.includes("__POLL__");
         const trimmedSummary = typeof step_summary === "string" ? step_summary.trim() : "";
+        const isInternalPoll = trimmedSummary === "__POLL__" || trimmedSummary.startsWith("__POLL__:");
 
         // Only append to RESPONSE.md if there was an ACTIVE user task dispatched!
         // During idle keep-alive hanging, activeTask is empty, so repeated/rephrased summaries or timeout notices are 100% ignored!
@@ -1119,40 +1166,96 @@ export async function runChatGptMcpServer(options: {
           }
         }
 
+        // Strict single-task mutex: If previous activeTask is not yet reported/cleared,
+        // do NOT pop another task from TASKS.txt! Strictly enforce one task execution at a time.
+        const currentPendingActiveTask = safeReadFile(activeTaskPath)?.trim() || "";
+        if (currentPendingActiveTask.length > 0) {
+          return result({
+            has_next: true,
+            session_id: targetSessionId,
+            workspace: activeDir,
+            next_task: currentPendingActiveTask,
+            message: `You are currently assigned to execute: '${currentPendingActiveTask}'. Please finish this task and submit your answer in step_summary before fetching the next task.`,
+          });
+        }
+
         // 25-second bounded wait: keeps heartbeats crisp and stays safely below any 30s/60s browser timeout.
         const WAIT_TIMEOUT_MS = 25_000;
         const startWait = Date.now();
 
         while (!extra.signal?.aborted && (Date.now() - startWait < WAIT_TIMEOUT_MS)) {
+          // Refresh heartbeat every poll iteration so 6pro-agent status stays accurate during long thinking gaps.
+          safeWriteFile(heartbeatPath, String(Date.now()));
+          let popLockFd: number | null = null;
           try {
             const raw = safeReadFile(tasksPath);
             if (raw !== null) {
               const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
               if (lines.length > 0) {
-                const nextTask = lines.shift()!;
-                safeWriteFile(tasksPath, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
+                // Cross-process mutex: prevent concurrent turns from double-dispatching.
+                popLockFd = tryAcquirePopLock(activeDir);
+                if (popLockFd === null) {
+                  await new Promise(r => setTimeout(r, 500));
+                  continue;
+                }
+                // Re-read under lock to avoid acting on a stale snapshot.
+                const lockedRaw = safeReadFile(tasksPath);
+                if (lockedRaw === null) {
+                  releasePopLock(activeDir, popLockFd);
+                  popLockFd = null;
+                  continue;
+                }
+                const lockedLines = lockedRaw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+                if (lockedLines.length === 0) {
+                  releasePopLock(activeDir, popLockFd);
+                  popLockFd = null;
+                  continue;
+                }
+                const nextLine = lockedLines.shift()!;
+                const nextTask = parseTaskLine(nextLine).content;
+                const ok = safeWriteFile(tasksPath, lockedLines.join("\n") + (lockedLines.length > 0 ? "\n" : ""));
+                if (!ok) {
+                  // Persist failed; do not dispatch to avoid duplicate execution on next poll.
+                  releasePopLock(activeDir, popLockFd);
+                  popLockFd = null;
+                  continue;
+                }
                 if (nextTask === "/exit" || nextTask === "__FINISH__") {
                   safeWriteFile(activeTaskPath, "");
+                  safeWriteFile(join(activeDir, ".stopped"), String(Date.now()));
+                  safeWriteFile(heartbeatPath, "0");
+                  releasePopLock(activeDir, popLockFd);
+                  popLockFd = null;
                   return result({
                     has_next: false,
                     session_id: targetSessionId,
                     message: `User explicitly commanded /exit for session '${targetSessionId}'. Please summarize all completed work and conclude your response cleanly.`,
                   });
                 }
+                const stoppedFile = join(activeDir, ".stopped");
+                if (existsSync(stoppedFile)) {
+                  try { rmSync(stoppedFile, { force: true }); } catch {}
+                }
                 // Record this newly dispatched task so the next completion report is recorded
                 safeWriteFile(activeTaskPath, nextTask);
+                releasePopLock(activeDir, popLockFd);
+                popLockFd = null;
                 return result({
                   has_next: true,
                   session_id: targetSessionId,
                   workspace: activeDir,
                   next_task: nextTask,
-                  remaining_tasks: lines.length,
+                  remaining_tasks: lockedLines.length,
                   message: `New instruction from user: '${nextTask}'. Target session is '${targetSessionId}', target workspace is '${activeDir}'. Please execute it, put your complete answer in step_summary, and call this tool again when finished.`,
                 });
               }
             }
           } catch (e) {
             // Transient NTFS file lock contention; self-heals on next 500ms poll
+          } finally {
+            if (popLockFd !== null) {
+              releasePopLock(activeDir, popLockFd);
+            }
           }
           await new Promise(r => setTimeout(r, 500));
         }
