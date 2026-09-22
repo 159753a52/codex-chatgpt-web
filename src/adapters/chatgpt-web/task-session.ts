@@ -1,0 +1,34 @@
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+
+export interface TaskSession {
+  sessionId: string;
+  directory: string;
+}
+
+function sessionId(value: string): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(value)
+    || /^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$/i.test(value)) {
+    throw new Error("Invalid task session ID; refusing to select another session");
+  }
+  return value;
+}
+
+// The native turn's cwd is supplied by the CLI, independently of UI selection or model text.
+// Automatic launches use <workspace>/sessions/<id>; manual launches must supply an explicit ID.
+export function bindTaskSession(cwd: string, requested?: string | null, bound?: TaskSession): TaskSession {
+  const explicit = requested == null ? undefined : sessionId(requested);
+  if (bound) {
+    if (explicit && explicit !== bound.sessionId) throw new Error("Task session mismatch: cannot rebind an active turn");
+    return bound;
+  }
+  if (!isAbsolute(cwd)) throw new Error("Task session requires an absolute native cwd");
+  const nativeCwd = resolve(cwd);
+  const sessionCwd = basename(dirname(nativeCwd)).toLowerCase() === "sessions";
+  const id = sessionCwd ? sessionId(basename(nativeCwd)) : explicit;
+  if (!id) throw new Error("Missing task session binding: launch in the session directory or supply session_id from the workspace root");
+  if (explicit && explicit !== id) throw new Error("Task session mismatch with native cwd");
+  const directory = sessionCwd ? nativeCwd : join(nativeCwd, "sessions", id);
+  if (!existsSync(join(directory, "meta.json"))) throw new Error("Task session does not exist; create it before starting the turn");
+  return { sessionId: id, directory: realpathSync(directory) };
+}

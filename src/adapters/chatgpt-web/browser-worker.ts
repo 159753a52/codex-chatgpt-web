@@ -2545,13 +2545,43 @@ export class ChatGptBrowserWorker {
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
     const currentUrl = page.url();
-    const isAlreadyOnChatPage = currentUrl.startsWith("https://chatgpt.com/c/") || currentUrl === CHATGPT_TARGET_CHAT_URL || (currentUrl.startsWith("https://chatgpt.com/") && !currentUrl.includes("login"));
-    if (!isAlreadyOnChatPage) {
-      await page.goto(CHATGPT_TARGET_CHAT_URL, {
-        waitUntil: "domcontentloaded",
-        timeout: 60_000,
-      });
-      await captureDiagnostic?.("chat-navigation-complete");
+    if (currentUrl.startsWith("https://chatgpt.com/c/")) {
+      // In a fresh non-retained turn, navigate to a clean new chat rather than polluting an old conversation
+      const newChatBtn = page.locator('[data-testid="create-new-chat-button"]').first();
+      let clicked = false;
+      try {
+        if (await newChatBtn.isVisible()) {
+          await newChatBtn.click();
+          await page.waitForURL(url => !url.href.startsWith("https://chatgpt.com/c/"), { timeout: 4_000 });
+          clicked = true;
+        }
+      } catch {}
+      if (!clicked) {
+        const newChatLink = page.locator('a[href="/"]').first();
+        try {
+          if (await newChatLink.isVisible()) {
+            await newChatLink.click();
+            await page.waitForURL(url => !url.href.startsWith("https://chatgpt.com/c/"), { timeout: 4_000 });
+            clicked = true;
+          }
+        } catch {}
+      }
+      if (!clicked && page.url().startsWith("https://chatgpt.com/c/")) {
+        await page.goto(CHATGPT_TARGET_CHAT_URL, {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+      }
+      await captureDiagnostic?.("new-chat-opened");
+    } else {
+      const isAlreadyOnChatPage = currentUrl === CHATGPT_TARGET_CHAT_URL || (currentUrl.startsWith("https://chatgpt.com/") && !currentUrl.includes("login"));
+      if (!isAlreadyOnChatPage) {
+        await page.goto(CHATGPT_TARGET_CHAT_URL, {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+        await captureDiagnostic?.("chat-navigation-complete");
+      }
     }
     let composer: Locator;
     try {

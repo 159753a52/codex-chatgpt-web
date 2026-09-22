@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -9,6 +9,7 @@ import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
+import { bindTaskSession, type TaskSession } from "./task-session";
 import { observeMcpToolCalls } from "./mcp-observation";
 
 interface ClaimedTurn {
@@ -50,7 +51,7 @@ export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 90_000;
 const ZERO_RISK_MCP_INSTRUCTIONS = [
   "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id in its request block.",
   "Use that request_id with the Codex tools needed for the task.",
-  "Always append all detailed reports, code diffs, and findings directly to the end of RESPONSE.md on disk (never overwrite; always use append mode >>). In step_summary, pass ONLY a 1-to-2-word status pointer (e.g. 'Done', 'Idle', or 'Poll'). NEVER put large text, code, markdown, or scripts into step_summary to avoid triggering cloud safety filters. NEVER call codex_fetch_next_task inside a loop in a script; always execute each call as a single, separate tool invocation. After completing work, call codex_fetch_next_task to report status. If next_task is '__POLL__', immediately call codex_fetch_next_task again with step_summary='Poll' to stay waiting. Never end this turn until has_next=false (user /exit).",
+  "Return completed reports in codex_fetch_next_task.response_text; the server appends them to the bound session RESPONSE.md. In step_summary, pass a short status keyword (e.g. 'Done', 'Idle', or 'Poll'). After completing work, call codex_fetch_next_task to report status. If next_task is '__POLL__', call codex_fetch_next_task again with step_summary='Poll' to stay waiting. When has_next is false, conclude the turn.",
   "When the user signals /exit (has_next=false), send the complete answer with codex_turn_complete.",
   "If a tool returns an error, report that error instead of changing the request_id.",
 ].join(" ");
@@ -798,15 +799,16 @@ export async function runChatGptMcpServer(options: {
         const extraMcpTools: CodexTool[] = [
           {
             name: "codex_fetch_next_task",
-            description: "Wait for user instruction and report progress in 1-hour quota reuse mode. Write full reports to RESPONSE.md on disk. step_summary must be 1-2 words (e.g. 'Done', 'Idle'). Do NOT call inside a loop.",
+            description: "Fetch the next instruction or subtask from the local workspace queue and report progress status. Pass the completed report in response_text to append it to the bound session RESPONSE.md, and pass a short status keyword in step_summary (e.g. 'Done', 'Idle').",
             parameters: {
               type: "object",
               properties: {
                 ...(contract === "safe"
                   ? { request_id: { type: "string", description: "Zero Risk request id" } }
                   : { turn_token: { type: "string", description: "Turn capability token" } }),
-                session_id: { type: "string", description: "Optional session identifier" },
-                step_summary: { type: "string", description: "Minimal status pointer: 1-2 words like 'Done', 'Idle', or 'Poll'. Keep under 10 chars." },
+                session_id: { type: "string", description: "Must match the native session directory or existing turn binding; required for manual workspace-root launches" },
+                response_text: { type: "string", description: "Completed task report, appended by the server to the bound session RESPONSE.md" },
+                step_summary: { type: "string", description: "Short status keyword (e.g. 'Done', 'Idle', 'Poll')" },
               },
               required: [contract === "safe" ? "request_id" : "turn_token"],
             },
@@ -948,23 +950,10 @@ export async function runChatGptMcpServer(options: {
     },
   );
 
-  const turnSessionMap = new Map<string, string>();
+  const turnSessionMap = new Map<string, TaskSession>();
   const sessionLastSummaryMap = new Map<string, string>();
   const turnStartedMarked = new Set<string>();
   const sessionResponseSnapshotMap = new Map<string, string>();
-
-  const DEFAULT_WORKSPACE = "D:\\Project\\Workspace";
-  const WORKSPACE_POINTER_PATH = join(DEFAULT_WORKSPACE, ".workspace_pointer");
-
-  function resolveWorkspace(): string {
-    try {
-      if (existsSync(WORKSPACE_POINTER_PATH)) {
-        const p = readFileSync(WORKSPACE_POINTER_PATH, "utf8").trim();
-        if (p && existsSync(p)) return p;
-      }
-    } catch {}
-    return DEFAULT_WORKSPACE;
-  }
 
   function safeReadFile(filePath: string, maxRetries = 3): string | null {
     for (let i = 0; i < maxRetries; i++) {
@@ -1052,12 +1041,13 @@ export async function runChatGptMcpServer(options: {
   server.registerTool(
     "codex_fetch_next_task",
     {
-      title: "Wait for user instruction and report progress",
-      description: afterSafeStart(contract, "Report current subtask progress/response and wait for user instructions without ending this turn. CRITICAL: This session is in 1-hour quota reuse mode. Even when no tasks are currently pending, you MUST continuously hang and wait by calling this tool in a loop. You are STRICTLY FORBIDDEN from producing final text, greetings, or concluding this turn until has_next is false (user explicitly commanded /exit). Always append all detailed reports, code diffs, and findings directly to the end of RESPONSE.md on disk (never overwrite; use append mode >>). step_summary must be a short pointer under 50 characters (e.g. 'Done, see RESPONSE.md'). Whenever has_next is true, you MUST immediately call this tool again."),
+      title: "Fetch next subtask and report progress",
+      description: afterSafeStart(contract, "Fetch the next instruction or subtask from the local workspace queue and report progress status. Pass the completed report in response_text to append it to the bound session RESPONSE.md, and pass a short status keyword in step_summary (e.g. 'Done', 'Idle')."),
       inputSchema: {
         ...turnReferenceInput(contract),
-        session_id: z.string().nullable().optional().describe("Optional session identifier (e.g. 'default', 'sess_xxx'). Defaults to current turn's locked session or 'default'"),
-        step_summary: z.string().max(500).nullable().optional().default("").describe("Short status pointer under 50 characters (e.g. 'Done, see RESPONSE.md'). Never put large text or code here."),
+        session_id: z.string().nullable().optional().describe("Must match the native session directory or the existing turn binding. Required on the first call from a workspace root; no UI/default fallback."),
+        response_text: z.string().min(1).max(1_000_000).optional().describe("Completed task report. The server appends it to the bound session RESPONSE.md; do not choose a filesystem path."),
+        step_summary: z.string().max(500).nullable().optional().default("").describe("Short status keyword (e.g. 'Done', 'Idle', 'Poll')"),
       },
       outputSchema: {
         has_next: z.boolean(),
@@ -1074,60 +1064,15 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
-        const { step_summary } = input as { step_summary?: string | null; session_id?: string | null };
-        const inputSessionId = (input as { session_id?: string | null }).session_id;
-
-        // Session Pinning & Sanitization
-        function sanitizeSessionId(raw: unknown): string | null {
-          if (typeof raw !== "string") return null;
-          const clean = raw.trim().replace(/[^a-zA-Z0-9_-]/g, "");
-          if (!clean) return null;
-          const isReserved = /^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]|CONIN\$?|CONOUT\$?)$/i.test(clean);
-          return isReserved ? null : clean;
-        }
-
-        let targetSessionId = sanitizeSessionId(inputSessionId);
-        if (!targetSessionId && turnSessionMap.has(claimed.bindingId)) {
-          // Sticky Session Affinity
-          targetSessionId = turnSessionMap.get(claimed.bindingId)!;
-        }
-
-        const defaultWorkspace = resolveWorkspace();
-
-        // Session fallback: ONLY if no target session was explicitly specified in arguments
-        // or sticky affinity, fall back to UI's .active_session or "default".
-        if (!targetSessionId) {
-          try {
-            const activeSessionPath = join(defaultWorkspace, ".active_session");
-            if (existsSync(activeSessionPath)) {
-              const activeSess = sanitizeSessionId(safeReadFile(activeSessionPath));
-              if (activeSess && existsSync(join(defaultWorkspace, "sessions", activeSess))) {
-                targetSessionId = activeSess;
-              }
-            }
-          } catch {}
-        }
-
-        if (!targetSessionId) {
-          targetSessionId = "default";
-        }
-        turnSessionMap.set(claimed.bindingId, targetSessionId);
-
-        let activeDir = defaultWorkspace;
-        if (targetSessionId === "default") {
-          const sessionDefaultDir = join(defaultWorkspace, "sessions", "default");
-          if (existsSync(sessionDefaultDir)) {
-            activeDir = sessionDefaultDir;
-          } else if (existsSync(join(defaultWorkspace, "TASKS.txt"))) {
-            activeDir = defaultWorkspace;
-          } else {
-            activeDir = sessionDefaultDir;
-            try { mkdirSync(activeDir, { recursive: true }); } catch {}
-          }
-        } else {
-          activeDir = join(defaultWorkspace, "sessions", targetSessionId);
-          try { mkdirSync(activeDir, { recursive: true }); } catch {}
-        }
+        const { step_summary, response_text } = input as { step_summary?: string | null; response_text?: string };
+        const session = bindTaskSession(
+          claimed.environment.cwd,
+          (input as { session_id?: string | null }).session_id,
+          turnSessionMap.get(claimed.bindingId),
+        );
+        turnSessionMap.set(claimed.bindingId, session);
+        const targetSessionId = session.sessionId;
+        const activeDir = session.directory;
 
         // Clean any stale .stopped on new incoming turn / connection so UI doesn't show stopped
         const stoppedFile = join(activeDir, ".stopped");
@@ -1153,13 +1098,20 @@ export async function runChatGptMcpServer(options: {
 
         const activeTask = safeReadFile(activeTaskPath)?.trim() || "";
         const trimmedSummary = typeof step_summary === "string" ? step_summary.trim() : "";
-        const isInternalPoll = trimmedSummary === "__POLL__" || trimmedSummary.startsWith("__POLL__:") || trimmedSummary === "POLL";
+        const isInternalPoll = /^(?:__POLL__(?::.*)?|poll|idle)$/i.test(trimmedSummary);
         const isResumeSignal = /(续接|接力|恢复|重连|resume|reconnect)/i.test(trimmedSummary);
 
         // Only clear activeTask and append to RESPONSE.md if there was an ACTIVE task dispatched,
         // and this is NOT an internal poll or reconnect/resume ping!
+        if (response_text !== undefined && (!activeTask || isInternalPoll || isResumeSignal)) {
+          throw new Error("Cannot report a result without an active task or while polling/resuming");
+        }
         if (activeTask.length > 0 && !isInternalPoll && !isResumeSignal) {
-          safeWriteFile(activeTaskPath, ""); // Clear active task once reported
+          if (response_text !== undefined) {
+            const report = `\n\n### 阶段汇报 [${new Date().toLocaleTimeString()}]\n${response_text}\n`;
+            if (!safeAppendFile(responsePath, report)) throw new Error("Failed to append task result; active task retained");
+          }
+          safeWriteFile(activeTaskPath, ""); // Clear only after the report has been persisted
 
           // Auto-recovery: If model accidentally overwrote RESPONSE.md instead of appending, restore previous history
           if (sessionResponseSnapshotMap.has(activeDir)) {
@@ -1177,7 +1129,7 @@ export async function runChatGptMcpServer(options: {
 
           const isPointer = /RESPONSE\.md|详见.*RESPONSE/i.test(trimmedSummary);
           // Only append summary if it is a real informative message, not a redundant file pointer
-          if (!isPointer && trimmedSummary.length > 0) {
+          if (response_text === undefined && !isPointer && trimmedSummary.length > 0) {
             try {
               const timeStr = new Date().toLocaleTimeString();
               const report = `\n\n### 阶段汇报 [${timeStr}]\n${trimmedSummary}\n`;
@@ -1208,7 +1160,7 @@ export async function runChatGptMcpServer(options: {
             session_id: targetSessionId,
             workspace: activeDir,
             next_task: currentPendingActiveTask,
-            message: `You are currently assigned to execute: '${currentPendingActiveTask}'. APPEND full details/code diffs directly to the end of RESPONSE.md on disk (never overwrite; always use append mode >>), pass ONLY a short status pointer under 50 characters in step_summary (e.g. 'Done, see RESPONSE.md'), and call this tool again when finished.`,
+            message: `You are currently assigned to execute: '${currentPendingActiveTask}'. Return full details in response_text with step_summary='Done' when finished. The server appends the report to this bound session's RESPONSE.md.`,
           });
         }
 
@@ -1254,7 +1206,6 @@ export async function runChatGptMcpServer(options: {
                   safeWriteFile(join(activeDir, ".stopped"), String(Date.now()));
                   safeWriteFile(heartbeatPath, "0");
                   try { rmSync(join(activeDir, ".turn_started"), { force: true }); } catch {}
-                  turnSessionMap.delete(claimed.bindingId);
                   turnStartedMarked.delete(claimed.bindingId);
                   releasePopLock(activeDir, popLock);
                   popLock = null;
@@ -1298,7 +1249,7 @@ export async function runChatGptMcpServer(options: {
                   workspace: activeDir,
                   next_task: nextTask,
                   remaining_tasks: lockedLines.length,
-                  message: `New instruction from user: '${nextTask}'. Target session is '${targetSessionId}'. Execute it and append full details directly to the end of RESPONSE.md on disk (mode >>). When complete, invoke codex_fetch_next_task as a single tool call with step_summary='Done'. Do NOT call inside a loop.`,
+                  message: `New instruction from user: '${nextTask}'. Target session is '${targetSessionId}'. Execute it. When complete, invoke codex_fetch_next_task with response_text containing the report and step_summary='Done'; the server appends it to this bound session's RESPONSE.md. Do NOT call inside a loop.`,
                 });
               }
             }
