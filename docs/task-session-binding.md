@@ -11,16 +11,25 @@ the root, the first call must explicitly supply `session_id`; missing, invalid, 
 unknown IDs fail instead of falling back to another session. An established turn
 cannot switch sessions. Create the session through 6pro-agent before launching.
 
-Submit completed reports with `codex_fetch_next_task(response_text=..., step_summary="Done")`.
+Submit completed reports with `codex_fetch_next_task(task_id=..., response_text=..., step_summary="Done")`.
+Use the exact ID returned when claiming the task. Protocol 2 stores a durable result
+for that ID; status words alone do not complete a task. Duplicate identical results
+are safe to retry. All task operations share `.pop_lock` with the 6pro-agent service.
 The server appends to the bound directory's `RESPONSE.md`. `Idle` and `Poll` do not
 complete an active task. Ordinary filesystem tools remain available for development;
 this routing contract is not a filesystem sandbox.
 
 ## Deferred validation and activation
 
-At the user's request, this change was not built, tested, or deployed to running services.
-The regression test is `bun test tests/task-session.test.ts`; it creates temporary
-directories and does not contact a browser or model. Also run `bun run typecheck`.
+Offline validation now includes `bun test tests/task-session.test.ts tests/task-queue-mcp.test.ts`
+and `bun x --no-install tsc --noEmit`. The MCP test uses a local stdio client and
+broker with temporary session directories; it does not contact a browser or model.
+No deployed runtime was rebuilt or restarted.
+
+The identical `task-store.cjs` is shipped here and in 6pro-agent's `lib/` directory.
+Update both copies together. The service, CLI and running MCP worker must all use
+protocol 2. Legacy unfinished tasks without IDs must be stopped before migration.
+An expired heartbeat is uncertain liveness, not proof that a task has stopped.
 
 Update 6pro-agent together with the gateway. Rebuild the runtime and restart the
 gateway/MCP and 6pro-agent only after ongoing sessions may safely be interrupted.

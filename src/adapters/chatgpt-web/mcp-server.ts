@@ -1,6 +1,4 @@
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, rmSync } from "node:fs";
-import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
@@ -9,6 +7,7 @@ import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
+import { poll as pollTaskQueue } from "./task-store.cjs";
 import { bindTaskSession, type TaskSession } from "./task-session";
 import { observeMcpToolCalls } from "./mcp-observation";
 
@@ -807,6 +806,7 @@ export async function runChatGptMcpServer(options: {
                   ? { request_id: { type: "string", description: "Zero Risk request id" } }
                   : { turn_token: { type: "string", description: "Turn capability token" } }),
                 session_id: { type: "string", description: "Must match the native session directory or existing turn binding; required for manual workspace-root launches" },
+                task_id: { type: "string", description: "The exact task_id returned when the task was claimed; required with response_text" },
                 response_text: { type: "string", description: "Completed task report, appended by the server to the bound session RESPONSE.md" },
                 step_summary: { type: "string", description: "Short status keyword (e.g. 'Done', 'Idle', 'Poll')" },
               },
@@ -951,93 +951,6 @@ export async function runChatGptMcpServer(options: {
   );
 
   const turnSessionMap = new Map<string, TaskSession>();
-  const sessionLastSummaryMap = new Map<string, string>();
-  const turnStartedMarked = new Set<string>();
-  const sessionResponseSnapshotMap = new Map<string, string>();
-
-  function safeReadFile(filePath: string, maxRetries = 3): string | null {
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        if (existsSync(filePath)) return readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
-        return null;
-      } catch {
-        if (i === maxRetries - 1) return null;
-      }
-    }
-    return null;
-  }
-
-  function safeWriteFile(filePath: string, content: string, maxRetries = 3): boolean {
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        writeFileSync(filePath, content, "utf8");
-        return true;
-      } catch {
-        if (i === maxRetries - 1) return false;
-      }
-    }
-    return false;
-  }
-
-  function safeAppendFile(filePath: string, content: string, maxRetries = 3): boolean {
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        appendFileSync(filePath, content, "utf8");
-        return true;
-      } catch {
-        if (i === maxRetries - 1) return false;
-      }
-    }
-    return false;
-  }
-
-  function parseTaskLine(line: string): { id: string; content: string } {
-    const sep = line.indexOf("|");
-    if (sep > 0 && /^[a-zA-Z0-9_-]+$/.test(line.slice(0, sep))) {
-      return { id: line.slice(0, sep), content: line.slice(sep + 1).trim() };
-    }
-    return { id: "", content: line.trim() };
-  }
-
-  interface PopLockHandle {
-    fd: number;
-    token: string;
-  }
-
-  function tryAcquirePopLock(dir: string): PopLockHandle | null {
-    const lockPath = join(dir, ".pop_lock");
-    const token = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    try {
-      const fd = openSync(lockPath, "wx");
-      writeFileSync(fd, token, "utf8");
-      return { fd, token };
-    } catch {
-      // Reclaim a stale lock left behind by a crashed process (older than 15s).
-      try {
-        const st = statSync(lockPath);
-        if (Date.now() - st.mtimeMs > 15_000) {
-          try { unlinkSync(lockPath); } catch {}
-          const fd = openSync(lockPath, "wx");
-          writeFileSync(fd, token, "utf8");
-          return { fd, token };
-        }
-      } catch {}
-      return null;
-    }
-  }
-
-  function releasePopLock(dir: string, lock: PopLockHandle): void {
-    const lockPath = join(dir, ".pop_lock");
-    try {
-      closeSync(lock.fd);
-    } catch {}
-    try {
-      if (existsSync(lockPath) && readFileSync(lockPath, "utf8").trim() === lock.token) {
-        unlinkSync(lockPath);
-      }
-    } catch {}
-  }
-
   server.registerTool(
     "codex_fetch_next_task",
     {
@@ -1046,6 +959,7 @@ export async function runChatGptMcpServer(options: {
       inputSchema: {
         ...turnReferenceInput(contract),
         session_id: z.string().nullable().optional().describe("Must match the native session directory or the existing turn binding. Required on the first call from a workspace root; no UI/default fallback."),
+        task_id: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/).optional().describe("Exact ID of the completed task; required when submitting response_text"),
         response_text: z.string().min(1).max(1_000_000).optional().describe("Completed task report. The server appends it to the bound session RESPONSE.md; do not choose a filesystem path."),
         step_summary: z.string().max(500).nullable().optional().default("").describe("Short status keyword (e.g. 'Done', 'Idle', 'Poll')"),
       },
@@ -1053,6 +967,7 @@ export async function runChatGptMcpServer(options: {
         has_next: z.boolean(),
         session_id: z.string().optional(),
         workspace: z.string().optional(),
+        task_id: z.string().optional(),
         next_task: z.string().optional(),
         remaining_tasks: z.number().int().nonnegative().optional(),
         message: z.string().optional(),
@@ -1064,220 +979,21 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
-        const { step_summary, response_text } = input as { step_summary?: string | null; response_text?: string };
-        const session = bindTaskSession(
-          claimed.environment.cwd,
-          (input as { session_id?: string | null }).session_id,
-          turnSessionMap.get(claimed.bindingId),
-        );
+        const session = bindTaskSession(claimed.environment.cwd,
+          (input as { session_id?: string | null }).session_id, turnSessionMap.get(claimed.bindingId));
         turnSessionMap.set(claimed.bindingId, session);
-        const targetSessionId = session.sessionId;
-        const activeDir = session.directory;
-
-        // Clean any stale .stopped on new incoming turn / connection so UI doesn't show stopped
-        const stoppedFile = join(activeDir, ".stopped");
-        if (existsSync(stoppedFile)) {
-          try { rmSync(stoppedFile, { force: true }); } catch {}
-        }
-
-        // Mark the start of this turn for 6pro-agent's 1h timeout detection (only once per binding).
-        if (!turnStartedMarked.has(claimed.bindingId)) {
-          turnStartedMarked.add(claimed.bindingId);
-          try {
-            safeWriteFile(join(activeDir, ".turn_started"), String(Date.now()));
-          } catch {}
-        }
-
-        const tasksPath = join(activeDir, "TASKS.txt");
-        const responsePath = join(activeDir, "RESPONSE.md");
-        const activeTaskPath = join(activeDir, ".active_task");
-        const heartbeatPath = join(activeDir, ".heartbeat");
-
-        // Touch session heartbeat so UI knows this exact session is actively connected
-        safeWriteFile(heartbeatPath, String(Date.now()));
-
-        const activeTask = safeReadFile(activeTaskPath)?.trim() || "";
-        const trimmedSummary = typeof step_summary === "string" ? step_summary.trim() : "";
-        const isInternalPoll = /^(?:__POLL__(?::.*)?|poll|idle)$/i.test(trimmedSummary);
-        const isResumeSignal = /(续接|接力|恢复|重连|resume|reconnect)/i.test(trimmedSummary);
-
-        // Only clear activeTask and append to RESPONSE.md if there was an ACTIVE task dispatched,
-        // and this is NOT an internal poll or reconnect/resume ping!
-        if (response_text !== undefined && (!activeTask || isInternalPoll || isResumeSignal)) {
-          throw new Error("Cannot report a result without an active task or while polling/resuming");
-        }
-        if (activeTask.length > 0 && !isInternalPoll && !isResumeSignal) {
-          if (response_text !== undefined) {
-            const report = `\n\n### 阶段汇报 [${new Date().toLocaleTimeString()}]\n${response_text}\n`;
-            if (!safeAppendFile(responsePath, report)) throw new Error("Failed to append task result; active task retained");
+        const startedAt = Date.now();
+        let report = { task_id: input.task_id, response_text: input.response_text };
+        while (!extra.signal?.aborted) {
+          const next = pollTaskQueue(session.directory, claimed.bindingId, report);
+          report = { task_id: undefined, response_text: undefined };
+          if (!next.has_next || next.next_task !== "__POLL__" || Date.now() - startedAt >= 25000) {
+            return result({ ...next, session_id: session.sessionId, workspace: session.directory });
           }
-          safeWriteFile(activeTaskPath, ""); // Clear only after the report has been persisted
-
-          // Auto-recovery: If model accidentally overwrote RESPONSE.md instead of appending, restore previous history
-          if (sessionResponseSnapshotMap.has(activeDir)) {
-            const previousSnapshot = sessionResponseSnapshotMap.get(activeDir)!;
-            sessionResponseSnapshotMap.delete(activeDir);
-            const currentDisk = safeReadFile(responsePath) ?? "";
-            if (previousSnapshot.trim().length > 0 && currentDisk.trim().length > 0) {
-              const probe = previousSnapshot.trim().slice(0, Math.min(80, previousSnapshot.trim().length));
-              if (!currentDisk.includes(probe)) {
-                console.warn(`[chatgpt-web-mcp] detected model overwritten RESPONSE.md in ${activeDir}, auto-restoring full history...`);
-                safeWriteFile(responsePath, previousSnapshot.trimEnd() + "\n\n" + currentDisk.trimStart());
-              }
-            }
-          }
-
-          const isPointer = /RESPONSE\.md|详见.*RESPONSE/i.test(trimmedSummary);
-          // Only append summary if it is a real informative message, not a redundant file pointer
-          if (response_text === undefined && !isPointer && trimmedSummary.length > 0) {
-            try {
-              const timeStr = new Date().toLocaleTimeString();
-              const report = `\n\n### 阶段汇报 [${timeStr}]\n${trimmedSummary}\n`;
-              safeAppendFile(responsePath, report);
-            } catch (err) {
-              console.error(`[chatgpt-web-mcp] failed to write response file: ${err}`);
-            }
-          }
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
+        return result({ has_next: false, session_id: session.sessionId, message: "Turn ended by client abort" });
 
-        // Priority check for /exit in TASKS.txt before enforcing pending activeTask mutex!
-        // This ensures user /exit command cannot be blocked by an orphaned activeTask!
-        const peekRaw = safeReadFile(tasksPath);
-        if (peekRaw) {
-          const firstLine = peekRaw.split(/\r?\n/).map(l => l.trim()).filter(Boolean)[0] || "";
-          const firstTask = parseTaskLine(firstLine).content;
-          if (firstTask === "/exit" || firstTask === "__FINISH__") {
-            safeWriteFile(activeTaskPath, "");
-          }
-        }
-
-        // Single-task mutex: If previous activeTask is still running (e.g. internal poll or reconnect),
-        // re-dispatch the current pending task rather than popping a new one.
-        const currentPendingActiveTask = safeReadFile(activeTaskPath)?.trim() || "";
-        if (currentPendingActiveTask.length > 0) {
-          return result({
-            has_next: true,
-            session_id: targetSessionId,
-            workspace: activeDir,
-            next_task: currentPendingActiveTask,
-            message: `You are currently assigned to execute: '${currentPendingActiveTask}'. Return full details in response_text with step_summary='Done' when finished. The server appends the report to this bound session's RESPONSE.md.`,
-          });
-        }
-
-        // 25-second bounded wait: keeps heartbeats crisp and stays safely below any 30s/60s browser timeout.
-        const WAIT_TIMEOUT_MS = 25_000;
-        const startWait = Date.now();
-
-        while (!extra.signal?.aborted && (Date.now() - startWait < WAIT_TIMEOUT_MS)) {
-          // Refresh heartbeat every poll iteration so 6pro-agent status stays accurate during long thinking gaps.
-          safeWriteFile(heartbeatPath, String(Date.now()));
-          let popLock: PopLockHandle | null = null;
-          try {
-            const raw = safeReadFile(tasksPath);
-            if (raw !== null) {
-              const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-              if (lines.length > 0) {
-                // Cross-process mutex: prevent concurrent turns from double-dispatching.
-                popLock = tryAcquirePopLock(activeDir);
-                if (popLock === null) {
-                  await new Promise(r => setTimeout(r, 500));
-                  continue;
-                }
-                // Re-read under lock to avoid acting on a stale snapshot.
-                const lockedRaw = safeReadFile(tasksPath);
-                if (lockedRaw === null) {
-                  releasePopLock(activeDir, popLock);
-                  popLock = null;
-                  continue;
-                }
-                const lockedLines = lockedRaw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-                if (lockedLines.length === 0) {
-                  releasePopLock(activeDir, popLock);
-                  popLock = null;
-                  continue;
-                }
-                const nextLine = lockedLines[0];
-                const nextTask = parseTaskLine(nextLine).content;
-
-                if (nextTask === "/exit" || nextTask === "__FINISH__") {
-                  lockedLines.shift();
-                  safeWriteFile(tasksPath, lockedLines.join("\n") + (lockedLines.length > 0 ? "\n" : ""));
-                  safeWriteFile(activeTaskPath, "");
-                  safeWriteFile(join(activeDir, ".stopped"), String(Date.now()));
-                  safeWriteFile(heartbeatPath, "0");
-                  try { rmSync(join(activeDir, ".turn_started"), { force: true }); } catch {}
-                  turnStartedMarked.delete(claimed.bindingId);
-                  releasePopLock(activeDir, popLock);
-                  popLock = null;
-                  return result({
-                    has_next: false,
-                    session_id: targetSessionId,
-                    message: contract === "safe"
-                      ? `User explicitly commanded /exit for session '${targetSessionId}'. Please call codex_turn_complete with your request_id and final_answer to conclude the turn.`
-                      : `User explicitly commanded /exit for session '${targetSessionId}'. Please summarize all completed work and conclude your response cleanly.`,
-                  });
-                }
-
-                // WAL (Write-Ahead Logging): write to .active_task first before removing from TASKS.txt
-                const activeOk = safeWriteFile(activeTaskPath, nextTask);
-                if (!activeOk) {
-                  releasePopLock(activeDir, popLock);
-                  popLock = null;
-                  continue;
-                }
-
-                lockedLines.shift();
-                const tasksOk = safeWriteFile(tasksPath, lockedLines.join("\n") + (lockedLines.length > 0 ? "\n" : ""));
-                if (!tasksOk) {
-                  safeWriteFile(activeTaskPath, ""); // Rollback active task on failure
-                  releasePopLock(activeDir, popLock);
-                  popLock = null;
-                  continue;
-                }
-
-                // Snapshot existing RESPONSE.md content before task execution to prevent overwrite data loss
-                const preTaskSnapshot = safeReadFile(responsePath) ?? "";
-                if (preTaskSnapshot.length > 0) {
-                  sessionResponseSnapshotMap.set(activeDir, preTaskSnapshot);
-                }
-
-                releasePopLock(activeDir, popLock);
-                popLock = null;
-                return result({
-                  has_next: true,
-                  session_id: targetSessionId,
-                  workspace: activeDir,
-                  next_task: nextTask,
-                  remaining_tasks: lockedLines.length,
-                  message: `New instruction from user: '${nextTask}'. Target session is '${targetSessionId}'. Execute it. When complete, invoke codex_fetch_next_task with response_text containing the report and step_summary='Done'; the server appends it to this bound session's RESPONSE.md. Do NOT call inside a loop.`,
-                });
-              }
-            }
-          } catch (e) {
-            // Transient NTFS file lock contention; self-heals on next 500ms poll
-          } finally {
-            if (popLock !== null) {
-              releasePopLock(activeDir, popLock);
-            }
-          }
-          await new Promise(r => setTimeout(r, 500));
-        }
-
-        if (extra.signal?.aborted) {
-          return result({
-            has_next: false,
-            session_id: targetSessionId,
-            message: "Turn ended by client abort.",
-          });
-        }
-
-        // 25s expired with no task: return lightweight __POLL__ instruction to prevent context window explosion
-        return result({
-          has_next: true,
-          session_id: targetSessionId,
-          next_task: "__POLL__",
-          message: "POLL",
-        });
       },
     ),
   );
