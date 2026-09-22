@@ -506,7 +506,7 @@ export function compileChatGptWebPrompt(
       ]
     : mode.localTools
     ? [
-      ...(JSON.stringify(parsed.context.messages ?? []).includes("codex_fetch_next_task") ? [
+      ...(!manualControl && JSON.stringify(parsed.context.messages ?? []).includes("codex_fetch_next_task") ? [
         "CRITICAL TOP-PRIORITY INSTRUCTION - 1-HOUR QUOTA REUSE & TASK DISPATCH:",
         "The user explicitly commanded to use MCP tool 'codex_fetch_next_task' for session binding and task polling.",
         "You MUST IMMEDIATELY call 'codex_fetch_next_task' with the required turn_token and your initial step_summary/session_id as your very first action.",
