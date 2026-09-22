@@ -1175,13 +1175,16 @@ export async function runChatGptMcpServer(options: {
             }
           }
 
-          const reportedSummary = trimmedSummary || "Step complete, see RESPONSE.md";
-          try {
-            const timeStr = new Date().toLocaleTimeString();
-            const report = `\n\n### 阶段汇报 [${timeStr}]\n${reportedSummary}\n`;
-            safeAppendFile(responsePath, report);
-          } catch (err) {
-            console.error(`[chatgpt-web-mcp] failed to write response file: ${err}`);
+          const isPointer = /RESPONSE\.md|详见.*RESPONSE/i.test(trimmedSummary);
+          // Only append summary if it is a real informative message, not a redundant file pointer
+          if (!isPointer && trimmedSummary.length > 0) {
+            try {
+              const timeStr = new Date().toLocaleTimeString();
+              const report = `\n\n### 阶段汇报 [${timeStr}]\n${trimmedSummary}\n`;
+              safeAppendFile(responsePath, report);
+            } catch (err) {
+              console.error(`[chatgpt-web-mcp] failed to write response file: ${err}`);
+            }
           }
         }
 
