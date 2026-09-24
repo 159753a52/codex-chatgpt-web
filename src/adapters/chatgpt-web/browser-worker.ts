@@ -1452,31 +1452,22 @@ export class ChatGptCompletionTracker {
       this.missingPostToolAnswerSince = undefined;
       return false;
     }
-    const isComplete = chatGptTurnIsComplete(state) || (state.responsePresent && !state.running);
-
-    if (this.postToolAnswerBaselineText === state.currentText) {
-      if (!isComplete) {
-        this.candidate = undefined;
-        this.missingPostToolAnswerSince = undefined;
-        return false;
-      }
-      if (this.candidate?.signature !== signature) {
-        this.candidate = { signature, since: now };
-        return false;
-      }
-      return now - this.candidate.since >= this.stableMs;
-    }
-
-    this.missingPostToolAnswerSince = undefined;
-    if (!isComplete) {
+    // A task-queue turn may legitimately end on text that predates its last tool call, so an
+    // unchanged post-tool answer is accepted. It must still be non-empty and settled. Without
+    // ChatGPT's completion action the page may only be pausing between two tool calls, so that
+    // weaker evidence has to stay unchanged for the much longer action grace period.
+    const settled = state.responsePresent && !state.running && state.currentText.length > 0;
+    if (!settled) {
       this.candidate = undefined;
+      this.missingPostToolAnswerSince = undefined;
       return false;
     }
+    const settleMs = chatGptTurnIsComplete(state) ? this.stableMs : this.missingPostToolAnswerMs;
     if (this.candidate?.signature !== signature) {
       this.candidate = { signature, since: now };
       return false;
     }
-    return now - this.candidate.since >= this.stableMs;
+    return now - this.candidate.since >= settleMs;
   }
 }
 

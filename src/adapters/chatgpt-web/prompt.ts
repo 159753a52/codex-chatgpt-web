@@ -42,6 +42,8 @@ export interface CompileChatGptWebPromptOptions {
    * reads or mutates ChatGPT's DOM. Completion is accepted only through the bound Zero Risk MCP tools.
    */
   manualControl?: true;
+  /** The turn is bound to a 6pro task-queue session (see usesTaskQueue). */
+  taskQueue?: boolean;
 }
 
 export const CHATGPT_BIGGER_CONTEXT_PARTS = 3 as const;
@@ -506,7 +508,7 @@ export function compileChatGptWebPrompt(
       ]
     : mode.localTools
     ? [
-      ...(!manualControl && JSON.stringify(parsed.context.messages ?? []).includes("codex_fetch_next_task") ? [
+      ...(!manualControl && options?.taskQueue === true ? [
         "Task Queue Coordination:",
         "The workflow uses MCP tool 'codex_fetch_next_task' for task dispatch and progress reporting.",
         "Call 'codex_fetch_next_task' with the required turn_token and your initial step_summary as your first action.",
@@ -586,7 +588,7 @@ export function compileChatGptWebPrompt(
     : mode.localTools
     ? [
       "<codex_transport_resume>",
-      JSON.stringify(parsed.context.messages ?? []).includes("codex_fetch_next_task")
+      options?.taskQueue === true
         ? `The task context is complete. Pass turn_token ${turnToken} unchanged. Call the MCP tool codex_fetch_next_task to fetch the next queued subtask.`
         : `The task context is complete. Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
       "</codex_transport_resume>",

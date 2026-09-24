@@ -18,6 +18,7 @@ import {
   type LauncherManualTurnStart,
 } from "../../launcher-browser-host";
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
+import { usesTaskQueue } from "./task-session";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
@@ -443,6 +444,7 @@ export function createChatGptWebAdapter(
       return {
         captureLunaCheckpoint,
         experimentalSkillAttachments,
+        taskQueue: usesTaskQueue(environment?.cwd, input.context.messages ?? []),
         ...(experimentalMultipartParts !== undefined
           ? { experimentalMultipartParts }
           : {}),

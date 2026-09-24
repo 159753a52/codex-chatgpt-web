@@ -4005,7 +4005,7 @@ test("Full mode has no fixed post-tool final-answer deadline", () => {
   }, 3_100 + CHATGPT_COMPLETION_SETTLE_MS)).toBeTrue();
 });
 
-test("Full mode fails closed when ChatGPT exposes completion without a post-tool final answer", () => {
+test("an unchanged post-tool answer completes only once settled, and weak evidence needs the long grace", () => {
   const tracker = new ChatGptCompletionTracker(500, 1_000);
   const partialLookingFinal = {
     responsePresent: true,
@@ -4017,10 +4017,25 @@ test("Full mode fails closed when ChatGPT exposes completion without a post-tool
 
   expect(tracker.observeToolBatch(1, partialLookingFinal.currentText)).toBeTrue();
   expect(tracker.update(partialLookingFinal, 1_000)).toBeFalse();
-  // Citation/markup hydration is not a new final answer and cannot release the boundary.
-  expect(tracker.update({ ...partialLookingFinal, currentHtml: '<p data-hydrated="true">partial answer</p>' }, 1_999)).toBeFalse();
-  expect(() => tracker.update(partialLookingFinal, 2_000))
-    .toThrow("completed without producing a final answer after its last Codex tool call");
+  // Citation/markup hydration restarts the settle window.
+  expect(tracker.update({ ...partialLookingFinal, currentHtml: '<p data-hydrated="true">partial answer</p>' }, 1_400)).toBeFalse();
+  expect(tracker.update({ ...partialLookingFinal, currentHtml: '<p data-hydrated="true">partial answer</p>' }, 1_900)).toBeTrue();
+
+  // Between two tool calls ChatGPT can briefly look idle without its completion action.
+  const between = new ChatGptCompletionTracker(500, 1_000);
+  const pausing = { ...partialLookingFinal, completionActionVisible: false };
+  expect(between.update(pausing, 0)).toBeFalse();
+  expect(between.update(pausing, 600)).toBeFalse();
+  expect(between.update({ ...pausing, running: true }, 700)).toBeFalse();
+  expect(between.update(pausing, 800)).toBeFalse();
+  expect(between.update(pausing, 1_799)).toBeFalse();
+  expect(between.update(pausing, 1_800)).toBeTrue();
+
+  // An empty idle response is never a final answer.
+  const empty = new ChatGptCompletionTracker(500, 1_000);
+  const blank = { ...pausing, currentText: "", currentHtml: "" };
+  expect(empty.update(blank, 0)).toBeFalse();
+  expect(empty.update(blank, 10_000)).toBeFalse();
 });
 
 test("a future progress timestamp is not treated as liveness", () => {

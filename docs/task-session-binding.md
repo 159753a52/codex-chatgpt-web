@@ -12,12 +12,22 @@ unknown IDs fail instead of falling back to another session. An established turn
 cannot switch sessions. Create the session through 6pro-agent before launching.
 
 Submit completed reports with `codex_fetch_next_task(task_id=..., response_text=..., step_summary="Done")`.
-Use the exact ID returned when claiming the task. Protocol 2 stores a durable result
+Use the exact ID returned when claiming the task. Protocol 3 stores a durable result
 for that ID; status words alone do not complete a task. Duplicate identical results
 are safe to retry. All task operations share `.pop_lock` with the 6pro-agent service.
 The server appends to the bound directory's `RESPONSE.md`. `Idle` and `Poll` do not
 complete an active task. Ordinary filesystem tools remain available for development;
 this routing contract is not a filesystem sandbox.
+
+Queue-loop prompt instructions are added only when the turn's cwd is a session directory, or
+when the human's latest message is a launch prompt naming `codex_fetch_next_task(session_id=...)`.
+Mentioning the tool elsewhere (tool output, code review) leaves an ordinary turn unchanged.
+`codex_fetch_next_task` is a top-level MCP tool and is not listed in `codex_tool_inventory`.
+Adding it changed the public connector ABI hash, so refresh the ChatGPT connector after upgrading.
+
+A new turn that finds a silent turn's unfinished claim keeps polling (`__POLL__`) instead of
+failing; after the user resets the worker in 6pro-agent it takes the requeued task. A stop aimed
+at the silent turn is acknowledged on its behalf and the new turn keeps serving.
 
 ## Deferred validation and activation
 
@@ -28,7 +38,7 @@ No deployed runtime was rebuilt or restarted.
 
 The identical `task-store.cjs` is shipped here and in 6pro-agent's `lib/` directory.
 Update both copies together. The service, CLI and running MCP worker must all use
-protocol 2. Legacy unfinished tasks without IDs must be stopped before migration.
+protocol 3. Legacy unfinished tasks without IDs must be stopped before migration.
 An expired heartbeat is uncertain liveness, not proof that a task has stopped.
 
 Update 6pro-agent together with the gateway. Rebuild the runtime and restart the

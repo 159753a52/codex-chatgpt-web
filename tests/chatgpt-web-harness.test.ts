@@ -2620,6 +2620,7 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
         "codex_exec",
+        "codex_fetch_next_task",
         "codex_tool_call",
         "codex_tool_inventory",
         "codex_view_image",
@@ -2635,8 +2636,9 @@ describe("ChatGPT outer-native harness v4", () => {
       }));
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
+      // Changed for codex_fetch_next_task (6pro task queue): refresh the ChatGPT connector after upgrading.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("9bb14902149337b52ce8598889497b1aba5a3265f28291df950bb38b5700a421");
+        .toBe("ced612bbeca1492e84beb376de8e7337a2e08b787b3fff3c1d87abf3bbb92ec8");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });

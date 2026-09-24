@@ -794,28 +794,9 @@ export async function runChatGptMcpServer(options: {
         const { query, offset, limit, include_schema } = input;
         const bound = claimed.environment;
         const needle = query?.trim().toLowerCase();
-        const baseTools = safeVisibleTools(bound, contract);
-        const extraMcpTools: CodexTool[] = [
-          {
-            name: "codex_fetch_next_task",
-            description: "Fetch the next instruction or subtask from the local workspace queue and report progress status. Pass the completed report in response_text to append it to the bound session RESPONSE.md, and pass a short status keyword in step_summary (e.g. 'Done', 'Idle').",
-            parameters: {
-              type: "object",
-              properties: {
-                ...(contract === "safe"
-                  ? { request_id: { type: "string", description: "Zero Risk request id" } }
-                  : { turn_token: { type: "string", description: "Turn capability token" } }),
-                session_id: { type: "string", description: "Must match the native session directory or existing turn binding; required for manual workspace-root launches" },
-                task_id: { type: "string", description: "The exact task_id returned when the task was claimed; required with response_text" },
-                response_text: { type: "string", description: "Completed task report, appended by the server to the bound session RESPONSE.md" },
-                step_summary: { type: "string", description: "Short status keyword (e.g. 'Done', 'Idle', 'Poll')" },
-              },
-              required: [contract === "safe" ? "request_id" : "turn_token"],
-            },
-          },
-        ];
-        const combinedTools = [...baseTools, ...extraMcpTools];
-        const directMatches = combinedTools.filter(tool => !needle || [
+        // codex_fetch_next_task is a top-level MCP tool, not a Codex Native tool reachable
+        // through codex_tool_call, so it is not listed in this inventory.
+        const directMatches = safeVisibleTools(bound, contract).filter(tool => !needle || [
           wireName(tool),
           tool.name,
           tool.namespace ?? "",
@@ -963,15 +944,18 @@ export async function runChatGptMcpServer(options: {
         response_text: z.string().min(1).max(1_000_000).optional().describe("Completed task report. The server appends it to the bound session RESPONSE.md; do not choose a filesystem path."),
         step_summary: z.string().max(500).nullable().optional().default("").describe("Short status keyword (e.g. 'Done', 'Idle', 'Poll')"),
       },
-      outputSchema: {
-        has_next: z.boolean(),
-        session_id: z.string().optional(),
-        workspace: z.string().optional(),
-        task_id: z.string().optional(),
-        next_task: z.string().optional(),
-        remaining_tasks: z.number().int().nonnegative().optional(),
-        message: z.string().optional(),
-      },
+      // Native connector tools publish no outputSchema (the cached connector ABI forbids it).
+      ...(contract === "safe" ? {
+        outputSchema: {
+          has_next: z.boolean(),
+          session_id: z.string().optional(),
+          workspace: z.string().optional(),
+          task_id: z.string().optional(),
+          next_task: z.string().optional(),
+          remaining_tasks: z.number().int().nonnegative().optional(),
+          message: z.string().optional(),
+        },
+      } : {}),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async (input, extra) => withClaimedTurn(
@@ -987,11 +971,14 @@ export async function runChatGptMcpServer(options: {
         while (!extra.signal?.aborted) {
           const next = pollTaskQueue(session.directory, claimed.bindingId, report);
           report = { task_id: undefined, response_text: undefined };
+          // A finished turn never polls again; drop its binding so the map does not grow per turn.
+          if (!next.has_next) turnSessionMap.delete(claimed.bindingId);
           if (!next.has_next || next.next_task !== "__POLL__" || Date.now() - startedAt >= 25000) {
             return result({ ...next, session_id: session.sessionId, workspace: session.directory });
           }
           await new Promise(resolve => setTimeout(resolve, 500));
         }
+        turnSessionMap.delete(claimed.bindingId);
         return result({ has_next: false, session_id: session.sessionId, message: "Turn ended by client abort" });
 
       },

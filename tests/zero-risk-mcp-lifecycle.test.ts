@@ -283,6 +283,7 @@ describe("Zero Risk public MCP ABI", () => {
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
         "codex_exec",
+        "codex_fetch_next_task",
         "codex_tool_call",
         "codex_tool_inventory",
         "codex_turn_complete",
@@ -298,6 +299,9 @@ describe("Zero Risk public MCP ABI", () => {
       expect(startSchema).toMatchObject({ required: ["request_id"] });
       expect(JSON.stringify(startSchema)).not.toContain("turn_token");
       expect(JSON.stringify(startSchema)).not.toContain("surface_nonce");
+      const fetchSchema = listed.tools.find(tool => tool.name === "codex_fetch_next_task")?.inputSchema;
+      expect(fetchSchema).toMatchObject({ required: expect.arrayContaining(["request_id"]) });
+      expect(JSON.stringify(fetchSchema)).not.toContain("turn_token");
       const inventorySchema = listed.tools.find(tool => tool.name === "codex_tool_inventory")?.inputSchema;
       expect(inventorySchema).toMatchObject({ required: expect.arrayContaining(["request_id"]) });
       expect(JSON.stringify(inventorySchema)).not.toContain("turn_token");
