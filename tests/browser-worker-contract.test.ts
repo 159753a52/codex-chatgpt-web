@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
-import { CHATGPT_COMPLETION_ACTION_GRACE_MS, CHATGPT_WEAK_COMPLETION_SETTLE_MS, ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPLETION_ACTION_GRACE_MS, CHATGPT_WEAK_COMPLETION_SETTLE_MS, chatGptReconciledTurnIdentity, ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -4057,6 +4057,22 @@ test("a finished answer without the completion action completes before the DOM h
     if (tracker.update(idle, now)) completedAt = now;
   }
   expect(completedAt).toBe(CHATGPT_WEAK_COMPLETION_SETTLE_MS);
+});
+
+test("a detached response is rebound when ChatGPT re-keys the thread, but not when another prompt opens", () => {
+  const binding = { identity: "a1", acceptedTurnIdentities: ["u1", "a1"], acceptedUserTurnCount: 1 };
+  // Unchanged identities keep the existing rebinding rules.
+  expect(chatGptReconciledTurnIdentity([], binding, { userIdentities: ["u1"], responseIdentities: ["a1"] })).toBe("a1");
+  // A finished Pro response reloaded the thread: the same single user turn under a new identity.
+  expect(chatGptReconciledTurnIdentity([], binding, { userIdentities: ["u1-saved"], responseIdentities: ["a1-saved"] }))
+    .toBe("a1-saved");
+  // A retained conversation reloads every earlier turn too; the bound response is the latest one.
+  const retained = { identity: "a2", acceptedTurnIdentities: ["u1", "a1", "u2", "a2"], acceptedUserTurnCount: 2 };
+  expect(chatGptReconciledTurnIdentity(["u1", "a1"], retained, { userIdentities: ["x1", "x2"], responseIdentities: ["y1", "y2"] }))
+    .toBe("y2");
+  // An additional user turn is a different prompt, never a reload.
+  expect(() => chatGptReconciledTurnIdentity([], binding, { userIdentities: ["u1", "u2"], responseIdentities: ["a1", "a2"] }))
+    .toThrow("opened another user turn");
 });
 
 test("a future progress timestamp is not treated as liveness", () => {
