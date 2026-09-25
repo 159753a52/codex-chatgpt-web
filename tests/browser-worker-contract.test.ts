@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
-import { ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPLETION_ACTION_GRACE_MS, CHATGPT_WEAK_COMPLETION_SETTLE_MS, ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -4036,6 +4036,27 @@ test("an unchanged post-tool answer completes only once settled, and weak eviden
   const blank = { ...pausing, currentText: "", currentHtml: "" };
   expect(empty.update(blank, 0)).toBeFalse();
   expect(empty.update(blank, 10_000)).toBeFalse();
+});
+
+test("a finished answer without the completion action completes before the DOM health verdict", () => {
+  // The worker loop consults the health tracker before the completion tracker on every observation,
+  // and no recent MCP activity suppresses the health verdict here.
+  expect(CHATGPT_WEAK_COMPLETION_SETTLE_MS).toBeLessThan(CHATGPT_COMPLETION_ACTION_GRACE_MS);
+  const health = new ChatGptTurnDomHealthTracker();
+  const tracker = new ChatGptCompletionTracker();
+  const idle = {
+    responsePresent: true,
+    running: false,
+    currentText: "final answer",
+    currentHtml: "<p>final answer</p>",
+    completionActionVisible: false,
+  };
+  let completedAt: number | undefined;
+  for (let now = 0; completedAt === undefined && now <= 2 * CHATGPT_COMPLETION_ACTION_GRACE_MS; now += 250) {
+    expect(health.update({ ...idle, externalProgressLive: false }, now)).toBeUndefined();
+    if (tracker.update(idle, now)) completedAt = now;
+  }
+  expect(completedAt).toBe(CHATGPT_WEAK_COMPLETION_SETTLE_MS);
 });
 
 test("a future progress timestamp is not treated as liveness", () => {

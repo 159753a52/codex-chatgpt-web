@@ -125,6 +125,12 @@ export const CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS = 180_000;
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
+/**
+ * Settle window for a finished-looking answer without ChatGPT's completed-turn action. It must stay
+ * below CHATGPT_COMPLETION_ACTION_GRACE_MS: ChatGptTurnDomHealthTracker runs first on every
+ * observation and fails the turn once that grace expires, so a longer window could never complete.
+ */
+export const CHATGPT_WEAK_COMPLETION_SETTLE_MS = 30_000;
 export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 const CHATGPT_CONNECTOR_MENTION_QUERY = "@codex";
@@ -1416,7 +1422,7 @@ export class ChatGptCompletionTracker {
 
   constructor(
     private readonly stableMs = CHATGPT_COMPLETION_SETTLE_MS,
-    private readonly missingPostToolAnswerMs = CHATGPT_COMPLETION_ACTION_GRACE_MS,
+    private readonly weakCompletionSettleMs = CHATGPT_WEAK_COMPLETION_SETTLE_MS,
   ) {}
 
   needsToolBatchObservation(revision: number): boolean {
@@ -1455,14 +1461,14 @@ export class ChatGptCompletionTracker {
     // A task-queue turn may legitimately end on text that predates its last tool call, so an
     // unchanged post-tool answer is accepted. It must still be non-empty and settled. Without
     // ChatGPT's completion action the page may only be pausing between two tool calls, so that
-    // weaker evidence has to stay unchanged for the much longer action grace period.
+    // weaker evidence has to stay unchanged for the longer weak-completion window.
     const settled = state.responsePresent && !state.running && state.currentText.length > 0;
     if (!settled) {
       this.candidate = undefined;
       this.missingPostToolAnswerSince = undefined;
       return false;
     }
-    const settleMs = chatGptTurnIsComplete(state) ? this.stableMs : this.missingPostToolAnswerMs;
+    const settleMs = chatGptTurnIsComplete(state) ? this.stableMs : this.weakCompletionSettleMs;
     if (this.candidate?.signature !== signature) {
       this.candidate = { signature, since: now };
       return false;

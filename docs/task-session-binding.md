@@ -27,7 +27,8 @@ Adding it changed the public connector ABI hash, so refresh the ChatGPT connecto
 
 A new turn that finds a silent turn's unfinished claim keeps polling (`__POLL__`) instead of
 failing; after the user resets the worker in 6pro-agent it takes the requeued task. A stop aimed
-at the silent turn is acknowledged on its behalf and the new turn keeps serving.
+at the silent turn is acknowledged on its behalf and the new turn keeps serving. While the stopped
+turn still has a live heartbeat, the new turn waits for that turn to acknowledge the stop itself.
 
 ## Deferred validation and activation
 
