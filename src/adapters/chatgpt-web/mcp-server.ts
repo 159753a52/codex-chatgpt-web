@@ -796,7 +796,8 @@ export async function runChatGptMcpServer(options: {
         const needle = query?.trim().toLowerCase();
         // codex_fetch_next_task is a top-level MCP tool, not a Codex Native tool reachable
         // through codex_tool_call, so it is not listed in this inventory.
-        const directMatches = safeVisibleTools(bound, contract).filter(tool => !needle || [
+        const visibleTools = safeVisibleTools(bound, contract);
+        const directMatches = visibleTools.filter(tool => !needle || [
           wireName(tool),
           tool.name,
           tool.namespace ?? "",
@@ -847,10 +848,23 @@ export async function runChatGptMcpServer(options: {
         }
         const page = [...directPage, ...nestedPage];
         const total = directMatches.length + nestedTotal;
+        // A filtered registry miss does not mean deferred tools are unavailable. Expose the
+        // actual native discovery entry separately; it is not a query match or an automatic call.
+        const discoveryTools = needle && total === 0
+          ? visibleTools.filter(tool => tool.toolSearch).map(tool => ({
+            wire_name: wireName(tool),
+            name: tool.name,
+            namespace: tool.namespace ?? null,
+            description: browserToolDescription(tool),
+            kind: "tool_search",
+            ...(include_schema ? { parameters: browserToolParameters(tool) } : {}),
+          }))
+          : [];
         return result({
           tools: page,
           total,
           next_offset: offset + page.length < total ? offset + page.length : null,
+          ...(discoveryTools.length > 0 ? { discovery_tools: discoveryTools } : {}),
         });
       },
     ),
@@ -860,7 +874,13 @@ export async function runChatGptMcpServer(options: {
     "codex_tool_call",
     {
       title: "Call any tool from the current Codex harness",
-      description: afterSafeStart(contract, "Invoke an exact wire_name returned by codex_tool_inventory. The outer Codex runtime performs the call, approvals, and UI lifecycle."),
+      description: afterSafeStart(contract, [
+        "Invoke an exact wire_name returned by codex_tool_inventory. The outer Codex runtime performs the call, approvals, and UI lifecycle.",
+        ...(contract === "native" ? [
+          `A pending context-compaction request can also provide the reserved ${CODEX_COMPACTION_CONTROL_WIRE_NAME} operation, which is not listed by inventory.`,
+          "Use only that request's issued control token and arguments {handoff_id, summary}. This operation submits the conversation summary to the pending Codex task; it does not execute commands, access files, or invoke other tools.",
+        ] : []),
+      ].join(" ")),
       inputSchema: {
         ...turnReferenceInput(contract),
         wire_name: z.string().min(1).max(1_000),

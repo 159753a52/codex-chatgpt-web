@@ -7,10 +7,12 @@ import {
   extractChatGptTurnEnvironment,
   extractChatGptCompactionSourceRevision,
   extractChatGptContinuationEnvironmentClaim,
+  extractChatGptSteeringEnvironmentClaim,
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptEnvironmentContext,
+  hasChatGptCalendarEnvironmentDelta,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
@@ -73,7 +75,12 @@ function sandboxPolicy(value: unknown, roots: string[], writableRoots: string[])
     return { type: "dangerFullAccess" };
   }
   if (parsed?.type === "workspaceWrite") {
-    if (typeof parsed.networkAccess !== "boolean" || writableRoots.some(path => !roots.some(root => contains(root, path)))) {
+    const policyRoots = absolutePaths(parsed.writableRoots, "workspace-write policy writable roots");
+    const declared = new Set(policyRoots.map(pathIdentity));
+    // Project membership is not the grant boundary: native Codex also authorizes
+    // external output directories. Both persisted grant sets must agree exactly.
+    if (typeof parsed.networkAccess !== "boolean" || policyRoots.length !== writableRoots.length
+      || writableRoots.some(path => !declared.has(pathIdentity(path)))) {
       throw new Error("Invalid persisted ChatGPT workspace-write policy");
     }
     return { type: "workspaceWrite", writableRoots, networkAccess: parsed.networkAccess };
@@ -159,8 +166,11 @@ export class ChatGptThreadEnvironmentStore {
       const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
       const historicalMessages = hasCurrentContext && !currentCompaction && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
-      if (hasCurrentContext && !currentCompaction && !historicalMessages) throw error;
-      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
+      const steeringClaim = hasCurrentContext && !currentCompaction
+        ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
+      const calendarDelta = hasCurrentContext && !currentCompaction && hasChatGptCalendarEnvironmentDelta(parsed);
+      if (hasCurrentContext && !currentCompaction && !historicalMessages && !steeringClaim && !calendarDelta) throw error;
+      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
@@ -177,8 +187,11 @@ export class ChatGptThreadEnvironmentStore {
           tools: parsed.context.tools,
         });
         if (rolloutEnvironment) {
+          if (calendarDelta && rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess") {
+            throw new Error("Calendar environment delta conflicts with its current Codex rollout");
+          }
           if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment)) {
-            throw new Error("Compaction continuation environment conflicts with its current Codex rollout");
+            throw new Error(`${currentCompaction ? "Compaction continuation" : "Steering"} environment conflicts with its current Codex rollout`);
           }
           this.set(rolloutIdentity.threadId, rolloutEnvironment);
           return rolloutEnvironment;

@@ -26,7 +26,7 @@ export interface CompiledChatGptWebPrompt {
   text: string;
   images: ChatGptWebPromptImage[];
   skillFiles?: ChatGptSkillFile[];
-  /** DEV-only transactional context transport. Production prompts remain inline. */
+  /** Transactional transport when Bigger Context is explicitly enabled. */
   multipart?: ChatGptWebMultipartPrompt;
   /** Oldest history items removed by native-style compaction fit recovery; absent on normal turns. */
   trimmedCompactionMessages?: number;
@@ -46,11 +46,13 @@ export interface CompileChatGptWebPromptOptions {
   taskQueue?: boolean;
 }
 
-export const CHATGPT_BIGGER_CONTEXT_PARTS = 3 as const;
+export const CHATGPT_BIGGER_CONTEXT_PARTS = 6 as const;
 export type ChatGptWebMultipartPartCount = 2 | typeof CHATGPT_BIGGER_CONTEXT_PARTS;
-export type ChatGptWebMultipartParts =
-  | readonly [string, string]
-  | readonly [string, string, string];
+export type ChatGptWebMultipartParts = readonly string[];
+
+export function isChatGptWebMultipartPartCount(value: number): value is ChatGptWebMultipartPartCount {
+  return value === 2 || value === CHATGPT_BIGGER_CONTEXT_PARTS;
+}
 
 export interface ChatGptWebMultipartPrompt {
   parts: ChatGptWebMultipartParts;
@@ -75,14 +77,14 @@ export function formatChatGptWebMultipartStage(
   payload: string,
   transactionId: string,
   partIndex: number,
-  totalParts: ChatGptWebMultipartPartCount = CHATGPT_BIGGER_CONTEXT_PARTS,
+  totalParts: number = CHATGPT_BIGGER_CONTEXT_PARTS,
 ): ChatGptWebMultipartStage {
   assertMultipartTransactionId(transactionId);
   if (
     !Number.isInteger(partIndex)
     || partIndex < 1
     || partIndex > totalParts
-    || (totalParts !== 2 && totalParts !== CHATGPT_BIGGER_CONTEXT_PARTS)
+    || !isChatGptWebMultipartPartCount(totalParts)
   ) {
     throw new Error("ChatGPT multipart stage index is invalid");
   }
@@ -118,8 +120,8 @@ export function formatChatGptWebMultipartCommit(
 ): string {
   assertMultipartTransactionId(transactionId);
   const totalParts = multipart.parts.length;
-  if (totalParts !== 2 && totalParts !== CHATGPT_BIGGER_CONTEXT_PARTS) {
-    throw new Error("ChatGPT multipart commit requires two or three staged parts");
+  if (!isChatGptWebMultipartPartCount(totalParts)) {
+    throw new Error("ChatGPT multipart commit requires two or six context parts");
   }
   const manifest = multipart.parts.map((payload, index) => (
     `${index + 1}/${totalParts}:${createHash("sha256").update(payload).digest("hex")}`
@@ -403,8 +405,7 @@ function partitionMultipartContext(
     total_parts: totalParts,
     records: group,
   })));
-  if (totalParts === 2) return [payloads[0]!, payloads[1]!];
-  return [payloads[0]!, payloads[1]!, payloads[2]!];
+  return payloads;
 }
 
 export function chatGptReadOnlyContextWarning(
@@ -453,8 +454,8 @@ export function compileChatGptWebPrompt(
       throw new Error("ChatGPT Zero Risk does not support rolling or multipart browser transport");
     }
   }
-  if (multipartParts !== undefined && multipartParts !== 2 && multipartParts !== CHATGPT_BIGGER_CONTEXT_PARTS) {
-    throw new Error("Bigger Context requires two or three multipart stages");
+  if (multipartParts !== undefined && !isChatGptWebMultipartPartCount(multipartParts)) {
+    throw new Error("Bigger Context requires two or six context parts");
   }
   if (multipartEnabled && parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error("Bigger Context is unavailable for Luna because its accumulated browser transcript still shares one 28,000-token transport budget");
@@ -514,8 +515,10 @@ export function compileChatGptWebPrompt(
         "Call 'codex_fetch_next_task' with the required turn_token and your initial step_summary as your first action.",
       ] : []),
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
+      "These tools are connected by the user to their Codex runtime; local actions execute on that runtime's device under its configured sandbox and approval rules. Assess each action by its actual effects and the user's authorization; an authenticated connection does not make every action low risk.",
       "Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.",
       "Use actual Codex Native results as evidence for local observations and effects.",
+      "Report the actual error when a tool fails. Do not claim a safety or permission block without an explicit tool result or platform error supporting it. If approval is required, use the declared Codex approval flow; a denial does not authorize retrying the action through another tool. Without an error or execution result, say the action was not executed and its cause is unconfirmed.",
       "A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.",
       "After a deterministic tool failure, update the working hypothesis from that result and inspect the relevant repository or environment before choosing a different next action; do not repeat the same call unless its inputs or observable state changed.",
       "Continue using the available tools until the requested work is complete and verified.",
@@ -633,9 +636,7 @@ export function compileChatGptWebPrompt(
         version: 1, part_index: index + 1, total_parts: multipartParts, records: [],
       });
       const multipart: ChatGptWebMultipartPrompt = {
-        parts: multipartParts === 2
-          ? [emptyPart(0), emptyPart(1)]
-          : [emptyPart(0), emptyPart(1), emptyPart(2)],
+        parts: Array.from({ length: multipartParts! }, (_, index) => emptyPart(index)),
         commit: [
           ...sharedContract,
           ...skillContract,

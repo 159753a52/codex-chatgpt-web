@@ -7,8 +7,8 @@ import { atomicWriteFile } from "./config";
 import {
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
-  CHATGPT_TARGET_CHAT_URL,
   CHATGPT_TEMPORARY_CHAT_URL,
+  CHATGPT_COMPOSER_SELECTOR,
   detectChatGptAccountCapabilities,
 } from "./chatgpt-session";
 import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
@@ -52,7 +52,7 @@ interface LoginVerificationMarker {
 const SYSTEM_LOGIN_TIMEOUT_MS = 10 * 60_000;
 const SYSTEM_LOGIN_STOP_TIMEOUT_MS = 5_000;
 const LOGIN_STORAGE_ROOT_DOMAINS = ["chatgpt.com", "openai.com"] as const;
-const CHATGPT_ORIGIN = new URL(CHATGPT_TARGET_CHAT_URL).origin;
+const CHATGPT_ORIGIN = new URL(CHATGPT_TEMPORARY_CHAT_URL).origin;
 
 function browserProcessExited(browser: ChildProcess): boolean {
   return browser.exitCode !== null || browser.signalCode !== null;
@@ -167,8 +167,8 @@ async function inspectStoredState(
     const verifierContext = await verifierBrowser.newContext({ storageState });
     try {
       const verifierPage = await verifierContext.newPage();
-      await verifierPage.goto(CHATGPT_TARGET_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await verifierPage.getByRole("textbox", { name: "Chat with ChatGPT" }).waitFor({ state: "visible", timeout: 60_000 });
+      await verifierPage.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await verifierPage.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first().waitFor({ state: "visible", timeout: 60_000 });
       await assertAuthenticatedChatGptPage(verifierPage);
       await assertTemporaryChatPage(verifierPage);
       return { ...await detectChatGptAccountCapabilities(verifierPage), url: verifierPage.url() };
@@ -243,7 +243,7 @@ export async function captureSystemBrowserLogin(
       "--disable-background-mode",
       "--no-first-run",
       "--no-default-browser-check",
-      CHATGPT_TARGET_CHAT_URL,
+      CHATGPT_TEMPORARY_CHAT_URL,
     ], { env: process.env, stdio: "ignore" });
     let continuationRequested = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -310,7 +310,7 @@ export async function captureSystemBrowserLogin(
       body: "<!doctype html><meta charset=\"utf-8\"><title>Private login-state capture</title>",
     }));
     const page = context.pages()[0] ?? await context.newPage();
-    await page.goto(CHATGPT_TARGET_CHAT_URL, {
+    await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
       waitUntil: "domcontentloaded",
       timeout: Math.min(60_000, remainingTime()),
     });
@@ -388,7 +388,7 @@ export async function loginToChatGpt(
     "--disable-background-mode",
     "--no-first-run",
     "--no-default-browser-check",
-    CHATGPT_TARGET_CHAT_URL,
+    CHATGPT_TEMPORARY_CHAT_URL,
   ], { env: process.env, stdio: "ignore" });
   const loginExit = await new Promise<number>((resolveExit, rejectExit) => {
     loginBrowser.once("error", rejectExit);
@@ -407,13 +407,11 @@ export async function loginToChatGpt(
   });
   try {
     const page = context.pages()[0] ?? await context.newPage();
-    await page.goto(CHATGPT_TARGET_CHAT_URL, {
+    await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
-    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" }).or(
-      page.locator('[data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]'),
-    ).first();
+    const composer = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first();
     try {
       await composer.waitFor({ state: "visible", timeout: options.timeoutMs ?? 60_000 });
     } catch {
