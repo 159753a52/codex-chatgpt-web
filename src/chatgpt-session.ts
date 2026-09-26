@@ -30,7 +30,13 @@ export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slid
 export const CHATGPT_EFFORT_SLIDER_MAX_OPTIONS = 5;
 /** Resolve only inside the verified composer's form; multiple submitters are an error. */
 export const CHATGPT_SEND_BUTTON_SELECTOR = '[data-testid="send-button"], button[type="submit"]';
-export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"], form[data-chatgpt-composer] button[type="button"][aria-label="Stop"]';
+export const CHATGPT_STOP_BUTTON_SELECTOR = [
+  '[data-testid="stop-button"]',
+  'form[data-chatgpt-composer] button[type="button"][aria-label="Stop"]',
+  // The new composer's Stop button has no test id and its label follows the UI language.
+  // Without the Chinese label, generation looks finished and an aborted turn keeps running.
+  'form[data-chatgpt-composer] button[aria-label="停止"]',
+].join(", ");
 // The new footer is shared with user messages. Response extraction additionally requires
 // this control to FOLLOW the last assistant answer, excluding the user's earlier footer.
 export const CHATGPT_COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"], [data-turn-key] .turn-action-controls button';

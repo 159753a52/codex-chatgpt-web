@@ -5,6 +5,7 @@ import {
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
+  CHATGPT_STOP_BUTTON_SELECTOR,
   activateChatGptEffortMenu,
   assertNewChatPage,
   chatGptNewChatUrl,
@@ -53,6 +54,21 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
   const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
   expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual(["composer-testid", "prompt-textarea", "composer-lexical", "power-editor"]);
   expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model", "power-effort"]);
+});
+
+test("stop selector finds the new composer's English and Chinese Stop buttons only", () => {
+  const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+  const document = createDocument(`<body>
+  <button data-testid="stop-button" id="legacy-stop"></button>
+  <button type="button" aria-label="停止" id="unowned-stop"></button>
+  <form data-chatgpt-composer>
+    <button type="button" aria-label="添加文件等内容" id="add-files"></button>
+    <button type="button" aria-label="听写" id="dictation"></button>
+    <button type="button" aria-label="Stop" id="stop-en"></button>
+    <button aria-label="停止" id="stop-zh"></button>
+  </form></body>`);
+  const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
+  expect(matches(CHATGPT_STOP_BUTTON_SELECTOR)).toEqual(["legacy-stop", "stop-en", "stop-zh"]);
 });
 
 test("effort activation binds the owned menu after the control opens", async () => {
